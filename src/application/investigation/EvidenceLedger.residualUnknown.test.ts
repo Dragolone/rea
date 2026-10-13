@@ -123,6 +123,46 @@ describe("residual unknown registry reads and identity", () => {
     }
   });
 
+  it("keeps an exact atomic replay idempotent after its unknown is updated", () => {
+    const store = ledger();
+    const derived = evidence("replayed-comparison");
+    const question = input("Does an exact replay stay idempotent?");
+    const first = store.recordWithUnknown(
+      derived,
+      question,
+      mutation("replay"),
+    );
+    if (!first.ok || first.value === null)
+      throw new Error("Expected a new unknown");
+    expect(
+      store.recordWithUnknown(derived, question, mutation("replay")),
+    ).toEqual({ ok: true, value: null });
+    const updated = store.updateUnknown(
+      update(first.value),
+      mutation("replay-update"),
+    );
+    if (!updated.ok) throw updated.error;
+
+    expect(
+      store.recordWithUnknown(derived, question, mutation("replay")),
+    ).toEqual({ ok: true, value: null });
+    expect(
+      store.recordWithUnknown(
+        derived,
+        input("Does an exact replay stay idempotent?", { severity: "low" }),
+        mutation("replay"),
+      ),
+    ).toMatchObject({ ok: false, error: { reason: "already-exists" } });
+    expect(
+      store
+        .export()
+        .unknowns.filter(
+          ({ unknown_id }) => unknown_id === first.value?.unknown_id,
+        )
+        .map(({ revision }) => revision),
+    ).toEqual([1, 2]);
+  });
+
   it("merges record-only bundles without changing retained unknown history", () => {
     const store = ledger();
     const created = store.recordUnknown(
