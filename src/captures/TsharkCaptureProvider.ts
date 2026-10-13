@@ -27,6 +27,7 @@ import type { PacketCapturePort } from "../application/captures/PacketCaptureSer
 import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
 import {
   ArtifactAnalysisResources,
+  failureCapturedOutput,
   type ArtifactAnalysisRuntime,
 } from "../process/ArtifactAnalysisResources.js";
 import { readStableArtifact } from "../artifacts/readStableArtifact.js";
@@ -190,13 +191,9 @@ export class TsharkCaptureProvider implements PacketCapturePort {
             ...(this.launcher === undefined ? {} : { launcher: this.launcher }),
           },
         );
-        capturedOutput = {
-          stdout: output.stdout.text,
-          stderr: output.stderr.text,
-          truncated: output.diagnosticTruncated ?? false,
-          exit_code: output.exitCode ?? null,
-          signal: output.signal ?? null,
-        };
+        // Field discovery can print a ~22 MB glossary; failures carry excerpts.
+        const diagnostics = failureCapturedOutput(output);
+        capturedOutput = diagnostics;
         // Finish bounded integrity checks after output; service handles late cancellation with Evidence.
         const previousPhase = phase;
         phase = "integrity";
@@ -230,8 +227,9 @@ export class TsharkCaptureProvider implements PacketCapturePort {
             {
               diagnostics: {
                 exit_code: output.exitCode ?? null,
-                stdout: output.stdout.text,
-                stderr: output.stderr.text,
+                stdout: diagnostics.stdout,
+                stderr: diagnostics.stderr,
+                truncated: diagnostics.truncated,
               },
             },
           );

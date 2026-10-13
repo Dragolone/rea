@@ -26,6 +26,7 @@ const fixture = async (mode = "ok", failCleanup = false) => {
     `import {readFileSync, writeFileSync, chmodSync, truncateSync} from 'node:fs';
 if (process.argv.includes('--version')) { console.log(${JSON.stringify(mode)} === 'bad-version' ? 'TShark (Wireshark) 3.0.0' : 'TShark (Wireshark) 4.6.9 (fixture)'); console.error('version warning'); }
 else if (${JSON.stringify(mode)} === 'nonzero') { console.error('invalid decoder'); process.exitCode = 1; }
+else if (${JSON.stringify(mode)} === 'large-damaged-glossary') process.stdout.write('P\\tProtocol with a long display name\\tabbr\\n'.repeat(8000) + 'BAD\\n');
 else if (${JSON.stringify(mode)} === 'malformed-copy') { chmodSync('capture', 0o600); writeFileSync('capture', 'changed'); }
 else if (${JSON.stringify(mode)} === 'oversized-copy') { chmodSync('capture', 0o600); truncateSync('capture', 32 * 1024 * 1024 + 1); console.log('[]'); }
 else if (${JSON.stringify(mode)} === 'overflow') process.stdout.write('x'.repeat((process.argv.includes('-G') ? 33 : 5) * 1024 * 1024));
@@ -252,6 +253,21 @@ it.each([
         name.startsWith("decoder-"),
       ),
     ).toEqual([]);
+  },
+);
+
+it.each(["large-damaged-glossary", "overflow"])(
+  "carries a bounded output excerpt when %s field discovery fails",
+  async (mode) => {
+    const f = await fixture(mode);
+    const result = await f.service.inspectFields({ kind: "protocols" });
+    if (result.ok) throw new Error("Expected field discovery failure");
+    const captured = result.error.capturedOutput;
+    expect(captured?.truncated).toBe(true);
+    expect(Buffer.byteLength(captured?.stdout ?? "")).toBeLessThanOrEqual(
+      64 * 1024,
+    );
+    expect(captured?.stdout).toMatch(/^(?:P\t|x)/u);
   },
 );
 

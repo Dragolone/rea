@@ -23,8 +23,39 @@ import {
   type LinuxResourceLimits,
 } from "./LinuxResourceLimits.js";
 import type { PrivateRuntimeRoot } from "./PrivateRuntimeRoot.js";
-import type { ProviderProcessSupervisor } from "./ProviderProcess.js";
+import type {
+  ProviderProcessSnapshot,
+  ProviderProcessSupervisor,
+} from "./ProviderProcess.js";
 import { OwnedCommandFailure } from "./OwnedCommand.js";
+import { boundedUtf8Text } from "./boundedUtf8Text.js";
+
+/** Bytes of each stream a command failure carries as its diagnostic excerpt. */
+export const COMMAND_FAILURE_DIAGNOSTIC_BYTES = 64 * 1024;
+
+/** Bound a command's streams for failure diagnostics without cutting a code point. */
+export const failureCapturedOutput = (
+  snapshot: ProviderProcessSnapshot,
+): AnalysisCapturedOutput => {
+  const stdout = boundedUtf8Text(
+    snapshot.stdout.text,
+    COMMAND_FAILURE_DIAGNOSTIC_BYTES,
+  );
+  const stderr = boundedUtf8Text(
+    snapshot.stderr.text,
+    COMMAND_FAILURE_DIAGNOSTIC_BYTES,
+  );
+  return {
+    stdout: stdout.text,
+    stderr: stderr.text,
+    truncated:
+      (snapshot.diagnosticTruncated ?? false) ||
+      stdout.truncated ||
+      stderr.truncated,
+    exit_code: snapshot.exitCode ?? null,
+    signal: snapshot.signal ?? null,
+  };
+};
 
 export type ArtifactAnalysisRuntime = Pick<
   PrivateRuntimeRoot,
@@ -182,13 +213,7 @@ export class ArtifactAnalysisResources {
     const capturedOutput =
       cause.snapshot === null
         ? undefined
-        : {
-            stdout: cause.snapshot.stdout.text,
-            stderr: cause.snapshot.stderr.text,
-            truncated: cause.snapshot.diagnosticTruncated ?? false,
-            exit_code: cause.snapshot.exitCode ?? null,
-            signal: cause.snapshot.signal ?? null,
-          };
+        : failureCapturedOutput(cause.snapshot);
     const detail = {
       cause,
       ...(capturedOutput === undefined ? {} : { capturedOutput }),
