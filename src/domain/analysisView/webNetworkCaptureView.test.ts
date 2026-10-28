@@ -810,6 +810,56 @@ it.each([
   },
 );
 
+// Indexing only headline coordinates must not change what the preview
+// withholds or keeps beside many facets the headline checks never consult.
+it("keeps headline omissions and controls beside many unrelated facets", () => {
+  const unrelated = Array.from({ length: 20_000 }, (_, index) => ({
+    pointer: `/extension/values/${index}`,
+    producer_type: "integer",
+    literal: String(index),
+  }));
+  const [item] = nativePreview(
+    "mitmproxy",
+    {
+      method: "GET",
+      scheme: "https",
+      host: "secret.test",
+      port: 443,
+      path: "/a",
+    },
+    {
+      response: { http_version: "HTTP/1.1", reason: "OK", status_code: 200 },
+      sidecars: [
+        ...unrelated,
+        { pointer: "/request/port", producer_type: "integer", literal: "443" },
+        {
+          pointer: "/response/status_code",
+          producer_type: "integer",
+          literal: "200",
+        },
+        // A facet beneath the path says the producer held a container there.
+        { pointer: "/request/path/0", producer_type: "integer", literal: "1" },
+      ],
+      redactions: [
+        { pointer: "/request/host", reason: "explicit-sensitive-value" },
+      ],
+    },
+  ).items;
+  expect(item?.reported).toEqual({
+    type: "http",
+    request: { method: "GET", scheme: "https", port: 443 },
+    response: { http_version: "HTTP/1.1", reason: "OK", status_code: 200 },
+  });
+  expect(item?.numeric_literals).toEqual([
+    { pointer: "/request/port", producer_type: "integer", literal: "443" },
+    {
+      pointer: "/response/status_code",
+      producer_type: "integer",
+      literal: "200",
+    },
+  ]);
+});
+
 it("keeps an unpaired-surrogate path out despite replacement-character bytes", () => {
   const reported = nativePreview(
     "mitmproxy",
