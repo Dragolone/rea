@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { build } from "plist";
 
 import { createTestTempDirectory } from "../../../fixtures/temporaryDirectory.js";
 
@@ -21,6 +22,10 @@ import {
 } from "../../../../src/native/CommandRunner.js";
 import { err, ok } from "../../../../src/domain/result.js";
 import { parseLipoOutput } from "../../../../src/native/parsers/lipo.js";
+import {
+  inspectPlistSchema,
+  inspectSignatureSchema,
+} from "../../../../src/domain/native/nativeInspection.js";
 import { parseCodeSignature } from "../../../../src/native/parsers/codesign.js";
 import { prepareProcessOwnershipInspection } from "../../../../src/process/ProcessOwnershipObservation.js";
 import { projectAnalysisError } from "../../../../src/domain/analysisErrorProjection.js";
@@ -38,7 +43,13 @@ import {
   nativeFixture as fixture,
   nativeMachoTarget as machoTarget,
   nativeMachoTargetForFile,
+  nativeResolvedToolFixture,
 } from "../../../fixtures/nativeCommands.js";
+
+/** The file runner identifies selected .plist inputs as XML. */
+const writeFixturePlist = async (path: string): Promise<void> => {
+  await writeFile(path, build(JSON.parse(await fixture("plist.json"))));
+};
 
 const cleanupOwner = (runId: string): ProviderProcessSupervisor => {
   const child = Object.assign(new EventEmitter(), {
@@ -215,7 +226,7 @@ describe("native command output collection", () => {
       const digest = createHash("sha256")
         .update(await readFile(executable))
         .digest("hex");
-      return ok({ path: executable, sha256: digest });
+      return ok(nativeResolvedToolFixture(executable, digest));
     });
 
     const originalDigest = await install("original-tool-output");
@@ -241,7 +252,9 @@ describe("native command output collection", () => {
 
   it("retains the complete native command output", async () => {
     const runner = new XcrunCommandRunner({}, () =>
-      Promise.resolve(ok({ path: process.execPath, sha256: "a".repeat(64) })),
+      Promise.resolve(
+        ok(nativeResolvedToolFixture(process.execPath, "a".repeat(64))),
+      ),
     );
     const output = "x".repeat(4096);
     const captured = await runner.run(
@@ -255,7 +268,9 @@ describe("native command output collection", () => {
 
   it("retains both output streams and exit status when a command fails", async () => {
     const runner = new XcrunCommandRunner({}, () =>
-      Promise.resolve(ok({ path: process.execPath, sha256: "a".repeat(64) })),
+      Promise.resolve(
+        ok(nativeResolvedToolFixture(process.execPath, "a".repeat(64))),
+      ),
     );
     const result = await runner.run(
       "file",
@@ -285,7 +300,9 @@ describe("native command output collection", () => {
 
   it("retains accepted nonzero output as a complete command capture", async () => {
     const runner = new XcrunCommandRunner({}, () =>
-      Promise.resolve(ok({ path: process.execPath, sha256: "a".repeat(64) })),
+      Promise.resolve(
+        ok(nativeResolvedToolFixture(process.execPath, "a".repeat(64))),
+      ),
     );
     const result = await runner.run(
       "file",
@@ -311,7 +328,9 @@ describe("native command output collection", () => {
 describe("native command failure capture and limits", () => {
   it("projects captured diagnostics from a failed native provider command", async () => {
     const runner = new XcrunCommandRunner({}, () =>
-      Promise.resolve(ok({ path: process.execPath, sha256: "a".repeat(64) })),
+      Promise.resolve(
+        ok(nativeResolvedToolFixture(process.execPath, "a".repeat(64))),
+      ),
     );
     const result = await new NativeMacOSProvider({}, runner, "darwin")
       .createClient(machoTarget("/private/fixture"))
@@ -346,7 +365,9 @@ describe("native command failure capture and limits", () => {
     const runner = new XcrunCommandRunner(
       {},
       () =>
-        Promise.resolve(ok({ path: process.execPath, sha256: "a".repeat(64) })),
+        Promise.resolve(
+          ok(nativeResolvedToolFixture(process.execPath, "a".repeat(64))),
+        ),
       () => Promise.reject(inspection),
     );
     const result = await new NativeMacOSProvider({}, runner, "darwin")
@@ -367,7 +388,9 @@ describe("native command failure capture and limits", () => {
 
   it("retains output written before cancellation and reaps the stalled command", async () => {
     const runner = new XcrunCommandRunner({}, () =>
-      Promise.resolve(ok({ path: process.execPath, sha256: "a".repeat(64) })),
+      Promise.resolve(
+        ok(nativeResolvedToolFixture(process.execPath, "a".repeat(64))),
+      ),
     );
     const controller = new AbortController();
     const pending = runner.run(
@@ -422,7 +445,7 @@ describe("native owned cancellation boundary", () => {
         spawnOwnedProviderProcess({ ...options, expectedCommand: null });
       const runner = new XcrunCommandRunner(
         {},
-        async () => ok({ path: executable, sha256: executableSha256 }),
+        async () => ok(nativeResolvedToolFixture(executable, executableSha256)),
         launcher,
       );
       const client = new NativeMacOSProvider({}, runner, "darwin").createClient(
@@ -537,7 +560,7 @@ describe("native cancellation cleanup provenance", () => {
       };
       const runner = new XcrunCommandRunner(
         {},
-        async () => ok({ path: executable, sha256: executableSha256 }),
+        async () => ok(nativeResolvedToolFixture(executable, executableSha256)),
         launcher,
       );
       const client = new NativeMacOSProvider({}, runner, "darwin").createClient(
@@ -674,7 +697,7 @@ describe("native returned cleanup ownership", () => {
       };
       const runner = new XcrunCommandRunner(
         {},
-        async () => ok({ path: executable, sha256: executableSha256 }),
+        async () => ok(nativeResolvedToolFixture(executable, executableSha256)),
         launcher,
       );
       const client = new NativeMacOSProvider({}, runner, "darwin").createClient(
@@ -817,7 +840,9 @@ describe("native late cancellation with cleanup", () => {
     const runner = new XcrunCommandRunner(
       {},
       async () =>
-        ok({ path: "/controlled/native-tool", sha256: "a".repeat(64) }),
+        ok(
+          nativeResolvedToolFixture("/controlled/native-tool", "a".repeat(64)),
+        ),
       launcher,
     );
     const client = new NativeMacOSProvider({}, runner, "darwin").createClient(
@@ -870,7 +895,9 @@ describe("native late cancellation with cleanup", () => {
 describe("native command failure capture and limits", () => {
   it("bounds both failure streams at a UTF-8 boundary while keeping their totals", async () => {
     const runner = new XcrunCommandRunner({}, () =>
-      Promise.resolve(ok({ path: process.execPath, sha256: "a".repeat(64) })),
+      Promise.resolve(
+        ok(nativeResolvedToolFixture(process.execPath, "a".repeat(64))),
+      ),
     );
     // "é" is two bytes and straddles the excerpt boundary, so it is dropped whole.
     const stdout = `${"x".repeat(NATIVE_FAILURE_DIAGNOSTIC_BYTES - 1)}é${"y".repeat(1024)}`;
@@ -900,7 +927,9 @@ describe("native command failure capture and limits", () => {
 
   it("rejects output beyond the complete native-command budget", async () => {
     const runner = new XcrunCommandRunner({}, () =>
-      Promise.resolve(ok({ path: process.execPath, sha256: "a".repeat(64) })),
+      Promise.resolve(
+        ok(nativeResolvedToolFixture(process.execPath, "a".repeat(64))),
+      ),
     );
     const megabytesOverBudget =
       Math.ceil(NATIVE_COMMAND_OUTPUT_BUDGET_BYTES / (1024 * 1024)) + 1;
@@ -1320,9 +1349,9 @@ describe("native macOS provider inspection", () => {
     const executable = join(app, "Contents/MacOS/Fixture");
     await mkdir(join(app, "Contents/MacOS"), { recursive: true });
     await writeFile(executable, "fixture");
-    await writeFile(join(app, "Contents/Info.plist"), "fixture");
+    await writeFixturePlist(join(app, "Contents/Info.plist"));
     const externalPlist = join(directory, "Outside.plist");
-    await writeFile(externalPlist, "fixture");
+    await writeFixturePlist(externalPlist);
     const client = new NativeMacOSProvider(
       {},
       new FixtureRunner(),
@@ -1370,7 +1399,7 @@ describe("native macOS provider raw results", () => {
     const executable = join(app, "Contents/MacOS/Fixture");
     await mkdir(join(app, "Contents/MacOS"), { recursive: true });
     await writeFile(executable, "fixture");
-    await writeFile(join(app, "Contents/Info.plist"), "fixture");
+    await writeFixturePlist(join(app, "Contents/Info.plist"));
     const client = new NativeMacOSProvider(
       {},
       new FixtureRunner(),
@@ -1396,6 +1425,13 @@ describe("native macOS provider raw results", () => {
           expect.objectContaining({ tool: expect.any(String) }),
         ]),
       });
+      if (operation === "inspect_plist") {
+        const plist = inspectPlistSchema.parse(execution.value.result);
+        expect(plist.provenance.map(({ command }) => command)).toEqual([
+          ["/usr/bin/file", "-b", "$PLIST"],
+          ["/usr/bin/plutil", "-lint", "--", "$PLIST"],
+        ]);
+      }
     }
   });
 });
@@ -1407,13 +1443,13 @@ describe("native plist defaults for iOS-style bundles", () => {
     const executable = join(app, "Flat");
     await mkdir(app, { recursive: true });
     await writeFile(executable, "fixture");
-    await writeFile(join(app, "Info.plist"), "fixture");
+    await writeFixturePlist(join(app, "Info.plist"));
     const client = new NativeMacOSProvider(
       {},
       new FixtureRunner(),
       "darwin",
     ).createClient({
-      ...machoTarget(executable, app),
+      ...(await nativeMachoTargetForFile(executable, app)),
       bundleInfoPlist: join(app, "Info.plist"),
     });
 
@@ -1422,6 +1458,37 @@ describe("native plist defaults for iOS-style bundles", () => {
       source_path: join(app, "Info.plist"),
     });
   });
+});
+
+it("rejects malformed selected plist bytes before mocked conversion can invent facts", async () => {
+  directory = await createTestTempDirectory("rea-native-malformed-plist-");
+  const app = join(directory, "Malformed.app");
+  const path = join(app, "Contents/Info.plist");
+  await mkdir(join(app, "Contents"), { recursive: true });
+  await writeFile(path, "fixture");
+  const tools: string[] = [];
+  const replay = new FixtureRunner();
+  const runner: NativeCommandRunner = {
+    run(tool, arguments_, options) {
+      tools.push(tool);
+      return replay.run(tool, arguments_, options);
+    },
+  };
+  const client = new NativeMacOSProvider({}, runner, "darwin").createClient(
+    machoTarget(join(app, "Contents/MacOS/Fixture"), app),
+  );
+  for (const [parameters, tag] of [
+    [{}, "AnalysisCapabilityUnavailableError"],
+    [{ path }, "AnalysisInputError"],
+  ] as const) {
+    const result = await client.execute("inspect_plist", parameters);
+    expect(result).toMatchObject({
+      ok: false,
+      error: { _tag: tag, operation: "inspect_plist" },
+    });
+  }
+  expect(tools).toEqual(["file", "file"]);
+  expect(await readFile(path, "utf8")).toBe("fixture");
 });
 
 /** Emit entitlements whose dictionary also holds a legal `__proto__` key. */
@@ -1440,7 +1507,7 @@ class PrototypeEntitlementsRunner extends FixtureRunner {
 }
 
 describe("native signature entitlements", () => {
-  it("reports entitlement entries keyed __proto__ that the result omits", async () => {
+  it("retains own entitlement dictionary keys through signature Evidence", async () => {
     directory = await createTestTempDirectory("rea-signature-entitlements-");
     const executable = join(directory, "fixture");
     await writeFile(executable, "fixture");
@@ -1454,10 +1521,17 @@ describe("native signature entitlements", () => {
 
     if (!signature.ok) throw signature.error;
     expect(signature.value.result).toMatchObject({
-      entitlements: { "com.apple.security.app-sandbox": true },
+      entitlements: {
+        "com.apple.security.app-sandbox": true,
+        ["__proto__"]: { "com.apple.security.get-task-allow": true },
+      },
     });
-    expect(signature.value.limitations).toContain(
-      "Entitlements: 1 dictionary entry keyed __proto__ was omitted because REA results cannot represent that key.",
+    const observed = inspectSignatureSchema.parse(signature.value.result);
+    expect(
+      Object.prototype.hasOwnProperty.call(observed.entitlements, "__proto__"),
+    ).toBe(true);
+    expect(signature.value.limitations).not.toContainEqual(
+      expect.stringContaining("omitted"),
     );
   });
 });

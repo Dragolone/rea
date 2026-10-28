@@ -6,12 +6,18 @@ import type {
   ArtifactNode,
   ArtifactOccurrence,
 } from "./artifactGraph.js";
+import { AnalysisInputError } from "./analysisErrorCore.js";
 import { evidenceSchema } from "./evidence.js";
 import {
+  ArtifactInventoryCarrierError,
   hasCompleteInventoryCoverage,
   parseArtifactInventoryEvidence,
   type InventorySet,
 } from "./artifactInventoryEvidence.js";
+import {
+  nodeSeaEntryDeclaration,
+  pyInstallerEntryDeclaration,
+} from "./artifactFormatMetadata.js";
 import { prefixedDigestSchema } from "./../domain/digests.js";
 import { canonicalJson } from "./comparisonSemantics.js";
 
@@ -79,14 +85,16 @@ export const artifactComparisonResultSchema = z.object({
   left_manifest_id: prefixedDigestSchema("agm"),
   right_manifest_id: prefixedDigestSchema("agm"),
   summary: z.object({
-    unchanged: z.number().int().min(0),
-    added: z.number().int().min(0),
-    removed: z.number().int().min(0),
-    changed: z.number().int().min(0),
-    unknown: z.number().int().min(0),
-    contradiction: z.number().int().min(0).default(0),
+    unchanged: z.int().min(0),
+    added: z.int().min(0),
+    removed: z.int().min(0),
+    changed: z.int().min(0),
+    unknown: z.int().min(0),
+    contradiction: z.int().min(0).default(0),
   }),
   changes: z.array(artifactChangeSchema),
+  // Absent on legacy records; absence does not identify a contradicting side.
+  integrity_mismatch_evidence_ids: z.array(evidenceIdSchema).optional(),
   limitations: z.array(z.string()),
 });
 
@@ -95,13 +103,26 @@ export type ArtifactComparisonResult = z.infer<
 >;
 type ArtifactChange = z.infer<typeof artifactChangeSchema>;
 
+const comparisonInventory = (input: unknown, side: "left" | "right") => {
+  try {
+    return parseArtifactInventoryEvidence(input);
+  } catch (cause: unknown) {
+    if (!(cause instanceof ArtifactInventoryCarrierError)) throw cause;
+    throw new AnalysisInputError(
+      "compare_artifacts",
+      { cause, userMessage: cause.message },
+      [{ path: [side], reason: "invalid_value", message: cause.message }],
+    );
+  }
+};
+
 /** Compare complete inventory evidence without treating missing evidence as equality. */
 export const compareArtifacts = (
   leftEvidence: unknown,
   rightEvidence: unknown,
 ): ArtifactComparisonResult => {
-  const left = parseArtifactInventoryEvidence(leftEvidence);
-  const right = parseArtifactInventoryEvidence(rightEvidence);
+  const left = comparisonInventory(leftEvidence, "left");
+  const right = comparisonInventory(rightEvidence, "right");
   const leftComplete = left.inventory.complete;
   const rightComplete = right.inventory.complete;
   const sameScope =
@@ -163,6 +184,16 @@ export const compareArtifacts = (
     ...(right.inventory.coverage.status === "complete"
       ? []
       : ["Right artifact inventory traversal coverage is unknown."]),
+    ...(comparison.hasUnknownAsarPacking
+      ? [
+          "ASAR packing metadata is recorded on only one side for matching paths; omitted metadata may be a legacy observation and does not establish packed or unpacked storage.",
+        ]
+      : []),
+    ...(comparison.hasUnknownNodeSeaMetadata
+      ? [
+          "Node SEA member metadata is recorded on only one side for matching paths; omitted metadata may be a legacy observation and leaves the complete runtime member declaration unavailable.",
+        ]
+      : []),
     ...(comparison.hasAmbiguousDuplicatePaths
       ? [
           "Duplicate logical paths cannot be paired across inventories; comparisons for those paths are unknown.",
@@ -198,6 +229,17 @@ export const compareArtifacts = (
     right_manifest_id: right.inventory.manifest.manifest_id,
     summary,
     changes,
+    integrity_mismatch_evidence_ids: [
+      ...new Set(
+        [left, right].flatMap((source) =>
+          source.inventory.occurrences.some(
+            (occurrence) => occurrence.hash_status === "mismatched",
+          )
+            ? source.evidence.map((record) => record.evidence_id)
+            : [],
+        ),
+      ),
+    ].sort(compareUnicodeCodePoints),
     limitations: [...new Set(limitations)].sort(compareUnicodeCodePoints),
   });
 };
@@ -212,6 +254,8 @@ const compareOccurrences = (
 ): {
   readonly changes: ArtifactChange[];
   readonly hasAmbiguousDuplicatePaths: boolean;
+  readonly hasUnknownAsarPacking: boolean;
+  readonly hasUnknownNodeSeaMetadata: boolean;
 } => {
   const leftNodes = new Map(left.nodes.map((item) => [item.artifact_id, item]));
   const rightNodes = new Map(
@@ -224,6 +268,8 @@ const compareOccurrences = (
   ].sort(compareUnicodeCodePoints);
   const output: ArtifactChange[] = [];
   let hasAmbiguousDuplicatePaths = false;
+  let hasUnknownAsarPacking = false;
+  let hasUnknownNodeSeaMetadata = false;
   for (const path of paths) {
     const leftMatches = leftByPath.get(path) ?? [];
     const rightMatches = rightByPath.get(path) ?? [];
@@ -243,7 +289,13 @@ const compareOccurrences = (
     }
     const leftOccurrence = leftMatches[0];
     const rightOccurrence = rightMatches[0];
+    const metadata = occurrenceMetadata({ leftOccurrence, rightOccurrence });
+    if (leftOccurrence !== undefined && rightOccurrence !== undefined) {
+      if (metadata.asarPacking === "unknown") hasUnknownAsarPacking = true;
+      if (metadata.nodeSea === "unknown") hasUnknownNodeSeaMetadata = true;
+    }
     const change = classifyPath({
+      metadata,
       path,
       leftOccurrence,
       rightOccurrence,
@@ -257,7 +309,12 @@ const compareOccurrences = (
     });
     if (change !== null) output.push(change);
   }
-  return { changes: output, hasAmbiguousDuplicatePaths };
+  return {
+    changes: output,
+    hasAmbiguousDuplicatePaths,
+    hasUnknownAsarPacking,
+    hasUnknownNodeSeaMetadata,
+  };
 };
 
 const occurrencesByPath = (
@@ -274,6 +331,7 @@ const occurrencesByPath = (
 };
 
 interface ClassifyPathInput {
+  readonly metadata: OccurrenceMetadata;
   readonly path: string;
   readonly leftOccurrence: ArtifactOccurrence | undefined;
   readonly rightOccurrence: ArtifactOccurrence | undefined;
@@ -295,17 +353,20 @@ const buildArtifactChangeBase = (input: ClassifyPathInput) => ({
   evidence_links: [...input.evidenceLinks],
 });
 
-const classifyPresence = (input: ClassifyPathInput): ArtifactChange | null => {
+const classifyPresence = (
+  input: ClassifyPathInput,
+  base: ReturnType<typeof buildArtifactChangeBase>,
+): ArtifactChange | null => {
   const covered = input.path === "." ? input.rootCovered : input.entriesCovered;
   if (input.leftOccurrence === undefined)
     return {
-      ...buildArtifactChangeBase(input),
+      ...base,
       classification: covered ? "added" : "unknown",
       dimensions: [covered ? "content" : "availability"],
     };
   if (input.rightOccurrence === undefined)
     return {
-      ...buildArtifactChangeBase(input),
+      ...base,
       classification: covered ? "removed" : "unknown",
       dimensions: [covered ? "content" : "availability"],
     };
@@ -343,20 +404,140 @@ const classifyAvailability = (
 };
 
 const classifyPath = (input: ClassifyPathInput): ArtifactChange | null => {
-  const presence = classifyPresence(input);
-  if (presence !== null) return presence;
   const base = buildArtifactChangeBase(input);
+  // A declared/observed mismatch is known even without an opposite occurrence.
   const integrity = classifyIntegrity(input, base);
   if (integrity !== null) return integrity;
+  const presence = classifyPresence(input, base);
+  if (presence !== null) return presence;
+  const declaration = classifyPyInstallerDeclaration(input, base);
+  if (declaration.handled) return declaration.change;
   const availability = classifyAvailability(input, base);
-  if (availability !== null) return availability;
+  if (availability !== null)
+    return input.metadata.asarPacking === "changed" ||
+      input.metadata.nodeSea === "changed"
+      ? {
+          ...base,
+          classification: "changed",
+          dimensions: ["metadata", "availability"],
+        }
+      : availability;
   const dimensions = changedDimensions(input);
+  if (Object.values(input.metadata).includes("unknown")) {
+    if (dimensions.length === 0)
+      return {
+        ...base,
+        classification: "unknown",
+        dimensions: ["availability"],
+      };
+    dimensions.push("availability");
+  }
   return dimensions.length === 0
     ? null
     : { ...base, classification: "changed", dimensions };
 };
 
+type OccurrencePair = Pick<
+  ClassifyPathInput,
+  "leftOccurrence" | "rightOccurrence"
+>;
+
+type MetadataComparison = "unchanged" | "changed" | "unknown";
+
+interface OccurrenceMetadata {
+  readonly asarPacking: MetadataComparison;
+  readonly nodeSea: MetadataComparison;
+  readonly pyInstaller: MetadataComparison;
+}
+
+const compareOptionalMetadata = <T>(
+  left: T | undefined,
+  right: T | undefined,
+  declaration: (value: T) => unknown,
+): MetadataComparison => {
+  if (left === undefined || right === undefined)
+    return left === right ? "unchanged" : "unknown";
+  return canonicalJson(declaration(left)) === canonicalJson(declaration(right))
+    ? "unchanged"
+    : "changed";
+};
+
+/** Interpret each pair's format declarations once, preserving historical omission. */
+const occurrenceMetadata = (input: OccurrencePair): OccurrenceMetadata => {
+  const left = input.leftOccurrence;
+  const right = input.rightOccurrence;
+  return {
+    asarPacking: compareOptionalMetadata(
+      left?.unpacked,
+      right?.unpacked,
+      (value) => value,
+    ),
+    nodeSea: compareOptionalMetadata(
+      left?.format_metadata?.kind === "node-sea-entry"
+        ? left.format_metadata
+        : undefined,
+      right?.format_metadata?.kind === "node-sea-entry"
+        ? right.format_metadata
+        : undefined,
+      nodeSeaEntryDeclaration,
+    ),
+    pyInstaller: compareOptionalMetadata(
+      isPyInstallerEntry(left) ? left.format_metadata : undefined,
+      isPyInstallerEntry(right) ? right.format_metadata : undefined,
+      pyInstallerEntryDeclaration,
+    ),
+  };
+};
+
+const isPyInstallerEntry = (
+  occurrence: ArtifactOccurrence | undefined,
+): occurrence is ArtifactOccurrence & {
+  readonly format_metadata: Extract<
+    NonNullable<ArtifactOccurrence["format_metadata"]>,
+    { readonly kind: "pyinstaller-entry" }
+  >;
+} => occurrence?.format_metadata?.kind === "pyinstaller-entry";
+
+const classifyPyInstallerDeclaration = (
+  input: ClassifyPathInput,
+  base: ReturnType<typeof buildArtifactChangeBase>,
+): { readonly handled: boolean; readonly change: ArtifactChange | null } => {
+  const leftIsDeclaration = input.leftOccurrence?.entry_kind === "metadata";
+  const rightIsDeclaration = input.rightOccurrence?.entry_kind === "metadata";
+  if (!leftIsDeclaration && !rightIsDeclaration)
+    return { handled: false, change: null };
+  // Metadata is not inherently a PyInstaller declaration. Only apply this
+  // format-specific comparison when a producer explicitly identified one.
+  if (
+    !isPyInstallerEntry(input.leftOccurrence) &&
+    !isPyInstallerEntry(input.rightOccurrence)
+  )
+    return { handled: false, change: null };
+  if (!leftIsDeclaration || !rightIsDeclaration)
+    return { handled: false, change: null };
+  if (
+    !isPyInstallerEntry(input.leftOccurrence) ||
+    !isPyInstallerEntry(input.rightOccurrence)
+  )
+    return {
+      handled: true,
+      change: {
+        ...base,
+        classification: "unknown",
+        dimensions: ["availability"],
+      },
+    };
+  const changed = input.metadata.pyInstaller === "changed";
+  return {
+    handled: true,
+    change: changed
+      ? { ...base, classification: "changed", dimensions: ["metadata"] }
+      : null,
+  };
+};
+
 const changedDimensions = (input: {
+  readonly metadata: OccurrenceMetadata;
   readonly leftNode: ArtifactNode | undefined;
   readonly rightNode: ArtifactNode | undefined;
   readonly leftOccurrence: ArtifactOccurrence | undefined;
@@ -402,12 +583,15 @@ const changedDimensions = (input: {
 
 const metadataChanged = (
   input: {
+    readonly metadata: OccurrenceMetadata;
     readonly leftOccurrence: ArtifactOccurrence | undefined;
     readonly rightOccurrence: ArtifactOccurrence | undefined;
   },
   left: ArtifactNode,
   right: ArtifactNode,
 ): boolean =>
+  input.metadata.asarPacking === "changed" ||
+  input.metadata.nodeSea === "changed" ||
   left.media_type !== right.media_type ||
   left.architecture !== right.architecture ||
   left.content_state !== right.content_state ||
@@ -415,7 +599,8 @@ const metadataChanged = (
   input.leftOccurrence?.encrypted !== input.rightOccurrence?.encrypted ||
   JSON.stringify(left.limitations) !== JSON.stringify(right.limitations) ||
   JSON.stringify(input.leftOccurrence?.limitations) !==
-    JSON.stringify(input.rightOccurrence?.limitations);
+    JSON.stringify(input.rightOccurrence?.limitations) ||
+  input.metadata.pyInstaller === "changed";
 
 const nodeFor = (
   occurrence: ArtifactOccurrence | undefined,
@@ -444,6 +629,11 @@ const relationsByPath = (
           ? null
           : (occurrences.get(occurrence.parent_occurrence_id)?.logical_path ??
             null),
+      // Containment roots are path-normalized to avoid graph-wide deltas, but
+      // a source map's target is a semantic content identity, not its parent
+      // directory. Preserve that identity in the relation comparison.
+      mapped_artifact_id:
+        edge.relation === "maps-source" ? edge.parent_artifact_id : null,
       child_artifact_id: occurrence.artifact_id,
       relation: edge.relation,
       logical_path: occurrence.logical_path,
@@ -462,6 +652,8 @@ const relationsByPath = (
 interface RelationProjection {
   /** Logical parent is stable across graph-root ID changes. */
   readonly parent_logical_path: string | null;
+  /** Content identity is material for a maps-source edge. */
+  readonly mapped_artifact_id: string | null;
   readonly child_artifact_id: string;
   readonly relation: ArtifactInventoryResult["edges"][number]["relation"];
   readonly logical_path: string | null;

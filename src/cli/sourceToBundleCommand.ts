@@ -1,3 +1,4 @@
+import { projectCliAnalysisResult } from "./projectCliAnalysisResult.js";
 import { z } from "incur";
 import type { Logger } from "pino";
 import type { CliInstance } from "./types.js";
@@ -53,21 +54,24 @@ export const registerSourceToBundleCommand = (
                 resources,
               );
               if (!reference.ok) return reference;
-              const { compareSourceToBundleEvidenceValidated } =
+              const { compareSourceToBundleEvidence } =
                 await import("../application/javascript/JavaScriptApplicationWorkflowService.js");
-              return compareSourceToBundleEvidenceValidated({
+              const compared = compareSourceToBundleEvidence({
                 ...reference.value,
                 application: parsed.data.application,
               });
+              return compared.ok
+                ? { ok: true, value: compared.value.evidence }
+                : compared;
             },
             resources,
             "javascript-application-workflow",
             "compare_source_to_bundle",
             signal,
           );
-          return "evidence_id" in result
-            ? result
-            : { error: "Application workflow failed", ...result };
+          return result.ok
+            ? result.value
+            : { error: "Application workflow failed", ...result.error };
         }),
       ),
   });

@@ -6,7 +6,7 @@ import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { expect, onTestFinished } from "vitest";
 
-import { createEvidence } from "../../../src/domain/evidence.js";
+import { createEvidence, parseEvidence } from "../../../src/domain/evidence.js";
 import { bundleComparisonResultSchema } from "../../../src/domain/bundleComparison.js";
 import {
   createEvidenceBundle,
@@ -14,6 +14,14 @@ import {
 } from "../../../src/domain/evidenceBundle.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { cliTest } from "../../support/cli/cliFixture.js";
+
+cliTest("rejects the removed compare-bundles command", async ({ cli }) => {
+  const result = await cli.run({
+    arguments: ["compare-bundles", "left.json", "right.json", "--json"],
+  });
+  expect(result.exitCode).toBe(1);
+  expect(result.stdout).toContain("COMMAND_NOT_FOUND");
+});
 
 cliTest(
   "compares Evidence bundles without unexplained display-only changes",
@@ -103,6 +111,61 @@ cliTest(
           conclusion_kind: "unresolved_branch",
         }),
       ],
+    });
+    const pairs = [
+      {
+        left_evidence_id: record.evidence_id,
+        right_evidence_id: different.records[0]!.evidence_id,
+      },
+    ];
+    const paired = await cli.run({
+      arguments: [
+        "compare",
+        leftPath,
+        changedPath,
+        "--record_pairs",
+        JSON.stringify(pairs),
+        "--json",
+      ],
+    });
+    expect(paired.exitCode).toBe(0);
+    const pairedResult = bundleComparisonResultSchema.parse(paired.json);
+    expect(pairedResult).toMatchObject({
+      status: "changed",
+      summary: { records_changed: 1, unresolved: 0 },
+      changes: [
+        { classification: "changed", conclusion_kind: "observed_change" },
+      ],
+    });
+    const call = await cli.sharedMcpCall?.();
+    if (call === undefined) throw new Error("Expected shared MCP session");
+    const mcp = await call("compare_bundles", {
+      left_bundle_path: leftPath,
+      right_bundle_path: changedPath,
+      record_pairs: pairs,
+    });
+    expect(mcp.isError).not.toBe(true);
+    expect(
+      bundleComparisonResultSchema.parse(
+        parseEvidence(mcp.structuredContent).normalized_result,
+      ),
+    ).toEqual(pairedResult);
+    const absentPair = await cli.run({
+      arguments: [
+        "compare",
+        leftPath,
+        changedPath,
+        "--record_pairs",
+        JSON.stringify([
+          { ...pairs[0], left_evidence_id: `ev_${"f".repeat(64)}` },
+        ]),
+        "--json",
+      ],
+    });
+    expect(absentPair.exitCode).toBe(1);
+    expect(absentPair.json).toMatchObject({
+      code: "invalid_request",
+      details: { issues: [{ path: ["record_pairs", 0, "left_evidence_id"] }] },
     });
   },
 );

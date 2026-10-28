@@ -1,3 +1,4 @@
+import { requireOutputSchema } from "../toolOutputSchemaPrimitives.js";
 import { z } from "zod";
 import { evidenceSchema } from "../../domain/evidence.js";
 import { compareManagedMembersInputSchema } from "../../domain/managed/managedMemberComparison.js";
@@ -13,13 +14,6 @@ import {
   MANAGED_RECONSTRUCTION_IMPORT_EXAMPLE,
 } from "./managedWorkflowExamples.js";
 import { toolContractMetadata } from "../toolEffects.js";
-import { requireOutputSchema } from "../toolOutputSchemaPrimitives.js";
-
-/** Inline Evidence input for importing reconstruction. */
-export const managedReconstructionReferenceInputSchema =
-  managedReconstructionImportInputSchema.extend({
-    static_members: evidenceSchema,
-  });
 
 const managedApplicationGraphReferenceShape = z.strictObject({
   managed_artifact: evidenceSchema.optional(),
@@ -81,7 +75,7 @@ export const MANAGED_WORKFLOW_TOOL_CONTRACTS = [
     name: "compare_managed_members",
     ...toolContractMetadata("compare_managed_members"),
     description:
-      "Compare two authenticated inspect_managed_members Evidence records using unique-only tiers: exact declared type, name, and CIL/signature; exact declared type, name, and signature (decoded or not); exact declared type, name, and decoded structural method shape; then exact CIL/signature or decoded structural method shape alone, which never takes a member whose own declared type and name remain unpaired on the other side or whose declaring type is unresolved. Signatures compare type operands by name, not by build-local metadata row. Names alone are never a matching basis; a member whose signature was not decoded, or whose same-named counterpart's was not, stays unknown rather than added or removed. Metadata tokens remain build-local coordinates bound to each artifact SHA-256 and MVID, and the tuple digest does not itself remap them.",
+      "Compare two authenticated inspect_managed_members Evidence records using unique-only tiers: exact declared type, name, and CIL/signature; exact declared type, name, and signature (decoded or not); exact declared type, name, and decoded structural method shape; then exact CIL/signature or decoded structural method shape alone, which never takes a member whose own declared type and name remain unpaired on the other side or whose declaring type is unresolved. Signatures compare type operands by name, not by build-local metadata row. Names alone are never a matching basis; a member whose signature was not decoded, or whose same-named counterpart's was not, stays unknown rather than added or removed. Matched methods also compare aligned call-site shapes and observed target declaring-type/method names; missing or unaligned call edges and target names remain unknown. These static names do not prove overload identity or runtime dispatch. Metadata tokens remain build-local coordinates bound to each artifact SHA-256 and MVID, and the tuple digest does not itself remap them.",
     kind: "application",
     inputSchema: compareManagedMembersInputSchema,
     outputSchema: comparisonOutputSchema,
@@ -121,7 +115,7 @@ export const MANAGED_WORKFLOW_TOOL_CONTRACTS = [
     description:
       "Import decompiler-produced managed reconstruction against authenticated inspect_managed_members Evidence. The workflow locks each method to artifact SHA-256, MVID, metadata token, signature hash, and the limited decoded-IL tuple hash, records the decompiler identity and options, and marks C# or pseudocode as analyst inference rather than canonical byte observation.",
     kind: "application",
-    inputSchema: managedReconstructionReferenceInputSchema,
+    inputSchema: managedReconstructionImportInputSchema,
     outputSchema: reconstructionOutputSchema,
     examples: [
       {
@@ -139,7 +133,7 @@ export const MANAGED_WORKFLOW_TOOL_CONTRACTS = [
     name: "project_managed_application_graph",
     ...toolContractMetadata("project_managed_application_graph"),
     description:
-      "Project authenticated managed artifact, member, and native-boundary Evidence into the provider-neutral application graph without executing managed code, loading assemblies, or translating managed metadata tokens to native addresses. The graph preserves managed static observations as managed-specific nodes linked to source Evidence.",
+      "Project authenticated managed artifact, member, and native-boundary Evidence into the provider-neutral application graph without executing managed code, loading assemblies, or translating managed metadata tokens to native addresses. The graph preserves managed static observations as managed-specific nodes linked to source Evidence, with in-module calls and field-access edges; other call and field-access sites are counted in limitations.",
     kind: "application",
     inputSchema: managedApplicationGraphReferenceInputSchema,
     outputSchema: managedApplicationGraphOutputSchema,

@@ -7,9 +7,9 @@ import { z } from "zod";
 
 import {
   DEFAULT_SWIFTC_COMPILE_TIMEOUT_MS,
-  MAX_PROVIDER_STARTUP_TIMEOUT_MS,
   providerStartupTimeoutSchema,
 } from "../config/providerStartupTimeout.js";
+import { MAX_PROVIDER_STARTUP_TIMEOUT_MS } from "../domain/analysisResourceLimits.js";
 import { err, ok, type Result } from "../domain/result.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import type {
@@ -19,7 +19,12 @@ import type {
 import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
 import { safeParseJson } from "../domain/safeJson.js";
 import { boundedUtf8Text } from "./boundedUtf8Text.js";
-import { execFileOutput, execFileOutputFailure } from "./ExecFileOutput.js";
+import { snapshotEnvironment } from "./snapshotEnvironment.js";
+import {
+  execFileOutput,
+  execFileOutputFailure,
+  execFileFailureCapturedOutput,
+} from "./ExecFileOutput.js";
 import type {
   ProcessIdentityObservation,
   ProcessRunTokenObservation,
@@ -30,13 +35,13 @@ const responseSchema = z.strictObject({
   results: z.array(
     z.discriminatedUnion("state", [
       z.strictObject({
-        pid: z.number().int().positive(),
+        pid: z.int().positive(),
         state: z.literal("readable"),
         run_id: z.string().optional(),
         reason: z.null().optional(),
       }),
       z.strictObject({
-        pid: z.number().int().positive(),
+        pid: z.int().positive(),
         state: z.literal("unavailable"),
         run_id: z.union([z.string(), z.null()]).optional(),
         reason: z.string().min(1),
@@ -48,28 +53,28 @@ const identityResponseSchema = z.strictObject({
   results: z.array(
     z.discriminatedUnion("state", [
       z.strictObject({
-        pid: z.number().int().positive(),
+        pid: z.int().positive(),
         state: z.literal("absent"),
         identity: z.null().optional(),
         reason: z.literal("not-in-snapshot"),
       }),
       z.strictObject({
-        pid: z.number().int().positive(),
+        pid: z.int().positive(),
         state: z.literal("readable"),
         identity: z.string().min(1),
-        effective_uid: z.number().int().nonnegative().optional(),
+        effective_uid: z.int().nonnegative().optional(),
         lifecycle: z.enum(["non-zombie", "zombie"]).optional(),
         relation: z
           .strictObject({
             state: z.literal("observed"),
-            parent_pid: z.number().int().nonnegative(),
-            process_group_id: z.number().int().nonnegative(),
+            parent_pid: z.int().nonnegative(),
+            process_group_id: z.int().nonnegative(),
           })
           .optional(),
         reason: z.null().optional(),
       }),
       z.strictObject({
-        pid: z.number().int().positive(),
+        pid: z.int().positive(),
         state: z.literal("unavailable"),
         identity: z.null().optional(),
         reason: z.string().min(1),
@@ -256,18 +261,11 @@ const compilerFailureFacts = (
       ...(outcome === "timed_out" ? { timeoutMs } : {}),
     },
     capturedOutput: {
+      ...execFileFailureCapturedOutput(failure),
       stdout: stdout.text,
       stderr: stderr.text,
       truncated:
         stdout.truncated || stderr.truncated || failure.outputTruncated,
-      ...(failure.stdoutBytes === undefined
-        ? {}
-        : { stdout_bytes: failure.stdoutBytes }),
-      ...(failure.stderrBytes === undefined
-        ? {}
-        : { stderr_bytes: failure.stderrBytes }),
-      exit_code: typeof failure.code === "number" ? failure.code : null,
-      signal: failure.signal,
     },
   };
 };
@@ -410,7 +408,7 @@ export const createDarwinProcessRunTokenReader = (
     readonly compiler?: DarwinProcessReaderCompiler;
     /** Deadline for helper compilation, independent of provider execution. */
     readonly compileTimeoutMs?: number;
-    /** Environment consulted when `compileTimeoutMs` is omitted. */
+    /** Captured compiler/helper environment and default compile deadline. */
     readonly environment?: Readonly<Record<string, string | undefined>>;
     /**
      * Caller-owned directory holding the compiler's module cache. Unset keeps
@@ -424,7 +422,11 @@ export const createDarwinProcessRunTokenReader = (
     kind: "xcrun",
     executable: "/usr/bin/xcrun",
   };
-  const compilerTimeoutMs = resolveSwiftcCompileTimeoutMs(options);
+  const environment = snapshotEnvironment(options.environment ?? process.env);
+  const compilerTimeoutMs = resolveSwiftcCompileTimeoutMs({
+    ...options,
+    environment,
+  });
   const moduleCachePath = options.moduleCachePath ?? "";
   let root: ProcessReaderRoot | undefined;
   let executable: string | undefined;
@@ -499,7 +501,7 @@ export const createDarwinProcessRunTokenReader = (
       const compilerTemporary = join(operationRoot.path, "tmp");
       await mkdir(compilerTemporary);
       const compilerEnvironment: NodeJS.ProcessEnv = {
-        ...process.env,
+        ...environment,
         TMPDIR: compilerTemporary,
       };
       const compilerArguments =
@@ -643,6 +645,7 @@ export const createDarwinProcessRunTokenReader = (
     const pending = (async () => {
       const binary = await compile(signal);
       const { stdout } = await execFileOutput(binary, arguments_, {
+        env: environment,
         timeout: 15_000,
         stopSignal: "SIGTERM",
         ...(signal === undefined ? {} : { signal }),

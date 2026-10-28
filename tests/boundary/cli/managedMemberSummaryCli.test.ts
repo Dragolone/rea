@@ -84,6 +84,39 @@ cliTest(
 );
 
 cliTest(
+  "classifies a field MemberRef loaded by ldtoken in the CLI inspection",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-managed-ldtoken-cli-");
+    const path = join(root, "field-token.dll");
+    const il = Buffer.from([0xd0, 1, 0, 0, 0x0a, 0x26, 0x2a]);
+    await writeFile(
+      path,
+      buildManagedPeFixture({
+        targetFramework: null,
+        memberRefName: "Counter",
+        memberRefParentRaw: 8,
+        memberRefSignature: Buffer.from([0x06, 0x08]),
+        ilBody: Buffer.concat([Buffer.from([(il.length << 2) | 2]), il]),
+      }),
+    );
+    const inspected = await cli.run({
+      arguments: ["inspect-managed-members", path, "--json"],
+    });
+    expect(inspected.exitCode).toBe(0);
+    const evidence = parseEvidence(inspected.json);
+    const result = managedMemberInspectionSchema.parse(
+      evidence.normalized_result,
+    );
+    expect(result.member_refs[0]?.signature.kind).toBe("field");
+    expect(result.methods[0]?.body.anchors[0]).toMatchObject({
+      opcode: "ldtoken",
+      operand_kind: "field",
+      operand: "0x0a000001",
+    });
+  },
+);
+
+cliTest(
   "retains complete member Evidence for exact CLI pages after process exit and target removal",
   async ({ cli }) => {
     const root = await createTestTempDirectory("rea-member-summary-cli-");
@@ -100,6 +133,7 @@ cliTest(
     const omitted = await cli.run({ arguments: arguments_ });
     expect(omitted.exitCode).toBe(0);
     const complete = parseEvidence(omitted.json);
+    expect(complete.caller_input_path).toBe(path);
     const completeBundlePath = join(root, "complete.json");
     const explicit = await cli.run({
       arguments: [
@@ -111,12 +145,18 @@ cliTest(
       ],
     });
     expect(explicit.exitCode).toBe(0);
-    expect(parseEvidence(explicit.json).evidence_id).toBe(complete.evidence_id);
+    expect(parseEvidence(explicit.json)).toMatchObject({
+      evidence_id: complete.evidence_id,
+      caller_input_path: path,
+    });
     expect(
       parseEvidenceBundle(
         JSON.parse(await readFile(completeBundlePath, "utf8")),
-      ).records[0]?.evidence_id,
-    ).toBe(complete.evidence_id);
+      ).records[0],
+    ).toMatchObject({
+      evidence_id: complete.evidence_id,
+      caller_input_path: path,
+    });
 
     const reply = await cli.run({
       cwd: root,
@@ -130,6 +170,7 @@ cliTest(
     });
     expect(reply.exitCode).toBe(0);
     const receipt = parseEvidence(reply.json);
+    expect(receipt.caller_input_path).toBe(path);
     const summary = managedMemberSummaryViewResultSchema.parse(
       receipt.normalized_result,
     );
@@ -138,18 +179,23 @@ cliTest(
     expect(bundle.records).toHaveLength(1);
     const parent = bundle.records[0]!;
     expect(parent.evidence_id).toBe(complete.evidence_id);
+    expect(parent.caller_input_path).toBe(path);
     expect(parent.normalized_result).toEqual(complete.normalized_result);
     expect(parent.raw_result).toEqual(complete.raw_result);
     expect(parent.subject).toEqual(complete.subject);
     expect(parent.locations).toEqual(complete.locations);
-    expect(parent.parameters).toEqual({ type_names: typeNames });
+    expect(parent.parameters).toEqual({
+      type_names: typeNames,
+      input_path: path,
+    });
     expect(receipt.evidence_links).toEqual([parent.evidence_id]);
-    const portable = inspectAnalysisView({
+    const portable = await inspectAnalysisView({
       source: { kind: "inline", evidence: parent },
       view: { kind: "summary" },
     });
     if (!portable.ok) throw portable.error;
     expect(receipt.evidence_id).toBe(portable.value.evidence_id);
+    expect(portable.value).not.toHaveProperty("caller_input_path");
     expect(receipt.normalized_result).toEqual(portable.value.normalized_result);
     const report = managedMemberInspectionSchema.parse(
       parent.normalized_result,
@@ -160,6 +206,7 @@ cliTest(
     });
     expect(summary.summary.coverage).toEqual(report.coverage);
     expect(summary.summary.identity_scope).toEqual(report.identity_scope);
+    expect(summary.summary.assembly).toEqual(report.assembly);
     expect(summary.summary).not.toHaveProperty("member_refs");
     expect(summary.summary).not.toHaveProperty("methods");
 
@@ -204,6 +251,7 @@ cliTest(
         expect(response.exitCode).toBe(0);
         const evidence = parseEvidence(response.json);
         expect(evidence.evidence_links).toEqual([parent.evidence_id]);
+        expect(evidence).not.toHaveProperty("caller_input_path");
         expect(evidence.subject).toEqual(parent.subject);
         const page = analysisViewResultSchema.parse(evidence.normalized_result);
         if (page.kind !== "managed-members") throw new Error("Wrong page kind");
@@ -298,7 +346,7 @@ cliTest(
       expect(result.json).not.toHaveProperty("evidence_id");
       expect(result.json).not.toHaveProperty("normalized_result");
     }
-    expect(await readFile(path)).toEqual(bytes);
+    expect(Buffer.compare(await readFile(path), bytes)).toBe(0);
     expect(await readdir(root)).toEqual(["fixture.dll"]);
   },
 );
@@ -371,6 +419,39 @@ cliTest(
   },
 );
 
+cliTest(
+  "preserves decoded CIL and reports invalid LocalVarSigTok through CLI Evidence",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-member-locals-token-");
+    const path = join(root, "fixture.dll");
+    const body = Buffer.alloc(13);
+    body.writeUInt16LE(0x3003, 0);
+    body.writeUInt16LE(8, 2);
+    body.writeUInt32LE(1, 4);
+    body.writeUInt32LE(0x06000001, 8);
+    body[12] = 0x2a;
+    await writeFile(path, buildManagedPeFixture({ ilBody: body }));
+
+    const result = await cli.run({
+      arguments: ["inspect-managed-members", path, "--json"],
+    });
+    expect(result.exitCode).toBe(0);
+    const evidence = parseEvidence(result.json);
+    const inspection = managedMemberInspectionSchema.parse(
+      evidence.normalized_result,
+    );
+    expect(inspection.methods[0]?.body).toMatchObject({
+      status: "malformed",
+      local_var_sig_token: "0x06000001",
+      anchors: [expect.objectContaining({ opcode: "ret" })],
+    });
+    expect(inspection.coverage).toMatchObject({
+      state: "partial",
+      issues: [expect.objectContaining({ code: "invalid-row" })],
+    });
+  },
+);
+
 cliTest.for(
   (process.platform === "win32"
     ? (["event"] as const)
@@ -386,9 +467,7 @@ cliTest.for(
     const target = join(root, "fixture.dll");
     const destination = join(root, "parent.json");
     const marker = join(root, "signal.json");
-    const preload = resolve(
-      "tests/fixtures/managedPublicationSignalPreload.mjs",
-    );
+    const preload = resolve("tests/fixtures/evidencePublicationPreload.mjs");
     const prefix = join(await realpath(root), ".rea-write-");
     await writeFile(target, memberFixture());
     const reply = await cli.run({
@@ -407,7 +486,7 @@ cliTest.for(
       environment: {
         HOME: root,
         REA_LOG_LEVEL: "silent",
-        REA_TEST_MANAGED_PUBLICATION: JSON.stringify({
+        REA_TEST_EVIDENCE_PUBLICATION: JSON.stringify({
           prefix,
           marker,
           signal,

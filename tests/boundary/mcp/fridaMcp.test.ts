@@ -13,6 +13,7 @@ import { fridaSessionStatusSummaryViewResultSchema } from "../../../src/domain/a
 import { fridaSessionStatusSchema } from "../../../src/domain/fridaSessionStatus.js";
 import { evidenceBundleSummarySchema } from "../../../src/domain/evidenceRecordSummary.js";
 import { createEvidence, parseEvidence } from "../../../src/domain/evidence.js";
+import { parseMcpEvidenceBundle } from "../../fixtures/mcpEvidenceBundle.js";
 
 const createFridaTestProvider = (
   overrides: Partial<FridaInstrumentationPort> = {},
@@ -94,58 +95,74 @@ const createFridaTestProvider = (
   ...overrides,
 });
 
-it.each([false, true])(
-  "delivers Frida status summaries with complete retained Evidence (truncated=%s)",
-  async (truncated) => {
-    const id = "00000000-0000-4000-8000-000000000001";
-    const messages = [
-      {
-        type: "send",
-        payload: { token: "caller-selected-nonsecret", rows: [1, 2] },
-      },
-    ];
-    let reads = 0;
-    const session = createTestBinarySession(() => {
-      throw new Error("No binary provider");
-    });
-    const server = createServer(
-      { kind: "session", session },
-      {
-        fridaInstrumentation: createFridaTestProvider({
-          status(sessionId) {
-            reads++;
-            return {
-              sessionId,
-              deviceId: "local",
-              target: "fixture",
-              pid: 10,
-              mode: "attach",
-              state: "running",
-              targetResumeObserved: false,
-              scripts: [],
-              messages,
-              messagesTruncated: truncated,
-            };
-          },
-        }),
-      },
-    );
-    const client = new Client({ name: "frida-status-summary", version: "1" });
-    onTestFinished(async () => {
-      await client.close();
-      await server.close();
-      await session.close();
-    });
-    const [ct, st] = InMemoryTransport.createLinkedPair();
-    await server.connect(st);
-    await client.connect(ct);
-    const tools = (await client.listTools()).tools;
-    const tool = tools.find((t) => t.name === "frida_session_status");
-    if (!tool?.outputSchema) throw new Error("Missing Frida status schema");
-    const ajv = new Ajv2020({ strict: false, validateFormats: false });
-    expect(ajv.validateSchema(tool.inputSchema)).toBe(true);
-    const outputSchema: Record<string, unknown> = tool.outputSchema;
-    expect(ajv.validateSchema(outputSchema)).toBe(true);
+const connectFridaTestClient = async (
+  server: ReturnType<typeof createServer>,
+  session: ReturnType<typeof createTestBinarySession>,
+  name: string,
+): Promise<Client> => {
+  const client = new Client({ name, version: "1" });
+  onTestFinished(async () => {
+    await client.close();
+    await server.close();
+    await session.close();
+  });
+  const [clientTransport, serverTransport] =
+    InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  return client;
+};
+
+it("delivers Frida status summaries with complete retained Evidence for both truncation states", async () => {
+  const id = "00000000-0000-4000-8000-000000000001";
+  const messages = [
+    {
+      type: "send",
+      payload: { token: "caller-selected-nonsecret", rows: [1, 2] },
+    },
+  ];
+  let reads = 0;
+  let statusTruncated = false;
+  const session = createTestBinarySession(() => {
+    throw new Error("No binary provider");
+  });
+  const server = createServer(
+    { kind: "session", session },
+    {
+      fridaInstrumentation: createFridaTestProvider({
+        status(sessionId) {
+          reads++;
+          return {
+            sessionId,
+            deviceId: "local",
+            target: "fixture",
+            pid: 10,
+            mode: "attach",
+            state: "running",
+            targetResumeObserved: false,
+            scripts: [],
+            messages,
+            messagesTruncated: statusTruncated,
+          };
+        },
+      }),
+    },
+  );
+  const client = await connectFridaTestClient(
+    server,
+    session,
+    "frida-status-summary",
+  );
+  const tools = (await client.listTools()).tools;
+  const tool = tools.find((t) => t.name === "frida_session_status");
+  if (!tool?.outputSchema) throw new Error("Missing Frida status schema");
+  const ajv = new Ajv2020({ strict: false, validateFormats: false });
+  expect(ajv.validateSchema(tool.inputSchema)).toBe(true);
+  const outputSchema: Record<string, unknown> = tool.outputSchema;
+  expect(ajv.validateSchema(outputSchema)).toBe(true);
+  for (const truncated of [false, true]) {
+    statusTruncated = truncated;
+    const readsBefore = reads;
     const complete = await client.callTool({
       name: tool.name,
       arguments: { session_id: id },
@@ -199,7 +216,7 @@ it.each([false, true])(
       },
     });
     expect(retained.structuredContent).toEqual(evidence);
-    expect(reads).toBe(3);
+    expect(reads - readsBefore).toBe(3);
     const discovered = await client.callTool({
       name: "get_evidence_bundle",
       arguments: {
@@ -225,9 +242,7 @@ it.each([false, true])(
       arguments: {},
     });
     expect(bundle.isError).not.toBe(true);
-    expect(JSON.stringify(bundle.structuredContent)).toContain(
-      "caller-selected-nonsecret",
-    );
+    expect(parseMcpEvidenceBundle(bundle).records).toContainEqual(parent);
     expect(session.evidenceById(parent.evidence_id)).toEqual(parent);
     // Inline/file projection validates the owning result and exact source selection.
     const malformed = createEvidence(undefined, parent.provider ?? undefined, {
@@ -243,8 +258,8 @@ it.each([false, true])(
       },
     });
     expect(rejected.isError).toBe(true);
-  },
-);
+  }
+});
 
 const expectFridaToolsAvailable = async (client: Client) => {
   const inventory = await client.callTool({
@@ -348,16 +363,11 @@ it("advertises Frida MCP schemas and keeps remote credentials out of results", a
       fridaInstrumentation: createFridaTestProvider(),
     },
   );
-  const client = new Client({ name: "frida-contract", version: "1" });
-  onTestFinished(async () => {
-    await client.close();
-    await server.close();
-    await session.close();
-  });
-  const [clientTransport, serverTransport] =
-    InMemoryTransport.createLinkedPair();
-  await server.connect(serverTransport);
-  await client.connect(clientTransport);
+  const client = await connectFridaTestClient(
+    server,
+    session,
+    "frida-contract",
+  );
 
   const tools = (await client.listTools()).tools;
   const advertised = tools.find((tool) => tool.name === "list_frida_devices");
@@ -640,8 +650,17 @@ it("retains cancellation Evidence after the MCP client stops waiting", async () 
     name: "get_evidence_bundle",
     arguments: {},
   });
-  expect(JSON.stringify(bundle.structuredContent)).toContain("cancel-observed");
-  expect(JSON.stringify(bundle.structuredContent)).toContain(
-    "instrument_with_frida",
+  expect(bundle.isError).not.toBe(true);
+  expect(parseMcpEvidenceBundle(bundle).records).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        operation: "instrument_with_frida",
+        normalized_result: expect.objectContaining({
+          messages: expect.arrayContaining([
+            expect.objectContaining({ payload: "cancel-observed" }),
+          ]),
+        }),
+      }),
+    ]),
   );
 });

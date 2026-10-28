@@ -10,6 +10,12 @@ export interface PublishedEvidenceFile {
   readonly bytes: number;
 }
 
+/** Publication completion survives an explicitly excluded path identity. */
+export interface PublishedEvidenceFileObservation {
+  readonly path?: string;
+  readonly bytes: number;
+}
+
 /** Evidence identity, schema, or bundle manifests failed integrity checks. */
 export class EvidenceIntegrityError extends AnalysisError {
   readonly _tag = "EvidenceIntegrityError";
@@ -51,7 +57,7 @@ export class EvidenceFileError extends AnalysisError {
   /** Caller-selected path that failed, resolved against the working directory. */
   readonly path: string | undefined;
   /** Present only when a write committed before cleanup failed. */
-  readonly published: PublishedEvidenceFile | undefined;
+  readonly published: PublishedEvidenceFileObservation | undefined;
   /** Schema issues relative to the selected file's JSON root, never the request envelope. */
   readonly contentIssues: readonly AnalysisInputIssue[] | undefined;
 
@@ -63,10 +69,11 @@ export class EvidenceFileError extends AnalysisError {
       | "wrong-kind"
       | "invalid-json"
       | "missing"
+      | "path-limit"
       | "io",
     options?: AnalysisErrorOptions & {
       readonly path?: string;
-      readonly published?: PublishedEvidenceFile;
+      readonly published?: PublishedEvidenceFileObservation;
       readonly userMessage?: string;
       readonly contentIssues?: readonly AnalysisInputIssue[];
     },

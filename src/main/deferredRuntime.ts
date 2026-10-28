@@ -79,6 +79,9 @@ const initializeRuntime = async (
   const result = await runEager(
     {
       ...dependencies,
+      // The outer SDK transport already owns and frames this stream. Eager
+      // materialization owns providers only, never another copy of raw input.
+      stdin: undefined,
       registerShutdown: () => () => undefined,
       captureShutdown: (close) => {
         shutdown = close;
@@ -139,8 +142,8 @@ export const runDeferred = async (
         // A transport published after shutdown begins is still ours to close.
         await serving;
         const ownedHandle = handle;
-        const handleResults = Promise.allSettled([
-          ...(ownedHandle === undefined
+        const handleResults = Promise.allSettled(
+          ownedHandle === undefined
             ? []
             : [
                 Promise.resolve()
@@ -148,8 +151,8 @@ export const runDeferred = async (
                   .then(() => {
                     handle = undefined;
                   }),
-              ]),
-        ]);
+              ],
+        );
         // Servers published before the serving handle settles join this owner;
         // closeAll seals further publication before taking its snapshot.
         const [handles, instances] = await Promise.all([

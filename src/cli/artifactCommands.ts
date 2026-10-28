@@ -1,3 +1,4 @@
+import { projectCliAnalysisResult } from "./projectCliAnalysisResult.js";
 import {
   analysisEvidenceDeliveryOptions,
   cliEvidenceDeliveryInputError,
@@ -5,7 +6,8 @@ import {
 } from "./analysisEvidenceDelivery.js";
 import { withCommandCancellation } from "./commandCancellation.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
-import { ARTIFACT_GRAPH_PROVIDER } from "../application/InvestigationProviders.js";
+import { ARTIFACT_GRAPH_PROVIDER } from "../domain/investigationProviders.js";
+import { keyedArchiveInputSchema } from "../domain/apple/keyedArchive.js";
 import { z } from "incur";
 
 import type { DirectAnalysis } from "../composition/directAnalysis.js";
@@ -30,26 +32,20 @@ export const registerArtifactCommands = (
       "Inspect a Foundation keyed archive as an object-reference graph",
     args: z.object({
       path: z.string().describe("Foundation plist archive or Apple app bundle"),
-      archive: z
-        .string()
-        .default(".")
-        .describe("Relative archive path when the target is a bundle"),
+      archive: keyedArchiveInputSchema.shape.path.describe(
+        "Relative archive path when the target is a bundle",
+      ),
     }),
     options: z.object({
-      root: z.string().optional().describe("Named $top archive root"),
-      offset: z
-        .number()
-        .int()
-        .min(0)
-        .default(0)
-        .describe("First original object-table index"),
-      limit: z
-        .number()
-        .int()
-        .min(1)
-        .max(20000)
-        .default(20000)
-        .describe("Maximum object-table entries to return"),
+      root: keyedArchiveInputSchema.shape.root.describe(
+        "Named $top archive root",
+      ),
+      offset: keyedArchiveInputSchema.shape.offset.describe(
+        "First original object-table index",
+      ),
+      limit: keyedArchiveInputSchema.shape.limit.describe(
+        "Maximum object-table entries to return",
+      ),
     }),
     run: ({ args, options }) =>
       logCliCommand(logger, CLI_COMMANDS.inspectKeyedArchive, () =>
@@ -63,7 +59,7 @@ export const registerArtifactCommands = (
             ...(options.root === undefined ? {} : { root: options.root }),
           },
           logger,
-        ),
+        ).then(projectCliAnalysisResult),
       ),
   });
 };
@@ -103,7 +99,7 @@ const registerDylibResolutionCommand = (
               : { architecture: options.architecture }),
           },
           logger,
-        ),
+        ).then(projectCliAnalysisResult),
       ),
   });
 };
@@ -138,7 +134,7 @@ const registerAssetCatalogCommand = (
           "inspect_asset_catalog",
           { offset: options.offset, limit: options.limit },
           logger,
-        ),
+        ).then(projectCliAnalysisResult),
       ),
   });
 };
@@ -188,7 +184,7 @@ const registerInterfaceBuilderCommand = (
             max_connections: options.maxConnections,
           },
           logger,
-        ),
+        ).then(projectCliAnalysisResult),
       ),
   });
 };
@@ -220,7 +216,7 @@ const registerExtractionCommand = (
             output_root: createArtifactExtractionDestination(),
           },
           logger,
-        ),
+        ).then(projectCliAnalysisResult),
       ),
   });
 };

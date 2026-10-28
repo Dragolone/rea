@@ -1,16 +1,14 @@
+import { projectCliAnalysisResult } from "./projectCliAnalysisResult.js";
 import { z } from "incur";
 
 import { compareManagedMemberPaths } from "../application/managed/ManagedMemberComparisonService.js";
-import { verifyManagedNativeBoundariesEvidence } from "../application/managed/ManagedNativeVerificationService.js";
+import { executeManagedNativeBoundaries } from "../application/managed/ManagedNativeVerificationService.js";
 import { importManagedReconstructionEvidence } from "../application/managed/ManagedReconstructionService.js";
 import type { DirectAnalysis } from "../composition/directAnalysis.js";
-import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
 import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { parseCliJsonInput } from "../cliJsonInput.js";
-import { MANAGED_STATIC_PROVIDER } from "../application/InvestigationProviders.js";
-import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
+import { MANAGED_STATIC_PROVIDER } from "../domain/investigationProviders.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
-import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { CLI_COMMANDS } from "../cliCommandNames.js";
 import { logCliCommand } from "../cliLogging.js";
 import type { Logger } from "pino";
@@ -19,6 +17,7 @@ import { registerProjectManagedApplicationGraph } from "./managedProjectGraphCom
 import { managedMembersInputSchema } from "../contracts/managed/managedToolContracts.js";
 import { localPathStringSchema } from "../domain/localPath.js";
 import { withCommandCancellation } from "./commandCancellation.js";
+import { finishAnalysisCommand } from "./finishAnalysisCommand.js";
 
 export const registerManagedCommands = (
   cli: CliInstance,
@@ -46,7 +45,12 @@ const registerInspectManagedArtifact = (
     }),
     run: ({ args }) =>
       logCliCommand(logger, "inspect-managed-artifact", () =>
-        runProviderAnalysis(args.path, "inspect_managed_artifact", {}, logger),
+        runProviderAnalysis(
+          args.path,
+          "inspect_managed_artifact",
+          {},
+          logger,
+        ).then(projectCliAnalysisResult),
       ),
   });
 };
@@ -92,7 +96,7 @@ const registerInspectManagedMembers = (
                 ? {}
                 : { evidenceBundlePath: options.evidenceBundle }),
             },
-          ),
+          ).then(projectCliAnalysisResult),
         ),
       ),
   });
@@ -116,7 +120,7 @@ const registerInspectManagedNativeBoundaries = (
           "inspect_managed_native_boundaries",
           {},
           logger,
-        ),
+        ).then(projectCliAnalysisResult),
       ),
   });
 };
@@ -135,52 +139,30 @@ const registerCompareManagedMembers = (
       "Compare managed PE/CLI member inventories by exact declared type, name, and signature; names alone never form a match",
     args: compareManagedMemberArgs,
     run: ({ args }) =>
-      logCliCommand(logger, "compare-managed-members", async () => {
-        const resources = new ArtifactResourceScope();
-        const result = await compareManagedMemberPaths(
-          {
-            leftPath: args.leftPath,
-            rightPath: args.rightPath,
-          },
-          {},
-          resources,
-        );
-        try {
-          await resources.close();
-        } catch (cause: unknown) {
-          const cleanup = ArtifactReaderFailure.cleanupObservation(
-            cause,
+      withCommandCancellation((signal) =>
+        logCliCommand(logger, "compare-managed-members", async () => {
+          const resources = new ArtifactResourceScope();
+          const result = await finishAnalysisCommand(
+            () =>
+              compareManagedMemberPaths(
+                {
+                  leftPath: args.leftPath,
+                  rightPath: args.rightPath,
+                },
+                {},
+                resources,
+              ),
+            resources,
+            MANAGED_STATIC_PROVIDER.id,
+            "compare_managed_members",
+            signal,
             "Managed member comparison resources",
           );
-          const failure = new ProviderCleanupError(
-            MANAGED_STATIC_PROVIDER.id,
-            cleanup.resources,
-            { reason: cleanup.reason },
-            {
-              cause,
-              operation: "compare_managed_members",
-              ...(result.ok ? { partialObservation: result.value } : {}),
-            },
-          );
-          const error = result.ok
-            ? failure
-            : analysisErrorWithCleanupFailure(
-                result.error,
-                failure,
-                "compare_managed_members",
-              );
-          return {
-            error: "Managed member comparison failed",
-            ...projectAnalysisError(error),
-          };
-        }
-        return result.ok
-          ? result.value
-          : {
-              error: "Managed member comparison failed",
-              ...projectAnalysisError(result.error),
-            };
-      }),
+          return result.ok
+            ? result.value
+            : { error: "Managed member comparison failed", ...result.error };
+        }),
+      ),
   });
 };
 
@@ -228,8 +210,10 @@ const registerVerifyManagedNativeBoundaries = (
           "verify-managed-native-boundaries",
         );
         if (!input.ok) return input.error;
-        const result = verifyManagedNativeBoundariesEvidence(input.value);
-        return result.ok ? result.value : projectAnalysisError(result.error);
+        const result = executeManagedNativeBoundaries(input.value);
+        return result.ok
+          ? result.value.evidence
+          : projectAnalysisError(result.error);
       }),
   });
 };

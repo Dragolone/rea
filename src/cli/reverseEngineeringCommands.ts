@@ -185,7 +185,10 @@ export const registerReverseEngineeringCommands = (
             ),
           );
           return result.ok
-            ? publishCliAnalysisEvidence(result.value, delivery)
+            ? publishCliAnalysisEvidence(
+                { ok: true, value: result.value },
+                delivery,
+              )
             : projectAnalysisError(result.error);
         }),
       ),
@@ -225,7 +228,10 @@ export const registerReverseEngineeringCommands = (
               ),
             );
             return result.ok
-              ? publishCliAnalysisEvidence(result.value, delivery)
+              ? publishCliAnalysisEvidence(
+                  { ok: true, value: result.value },
+                  delivery,
+                )
               : projectAnalysisError(result.error);
           },
         ),
@@ -309,7 +315,11 @@ export const registerReverseEngineeringCommands = (
               const started = await manager.start(signal, {
                 inferiorTty: options.inferiorTty,
               });
-              if (!started.ok) return projectAnalysisError(started.error);
+              if (!started.ok)
+                return {
+                  ok: false as const,
+                  error: projectAnalysisError(started.error),
+                };
               sessionId = started.value.session_id;
               const executed = await manager.execute(
                 sessionId,
@@ -317,8 +327,11 @@ export const registerReverseEngineeringCommands = (
                 signal,
               );
               return executed.ok
-                ? executed.value.evidence
-                : projectAnalysisError(executed.error);
+                ? { ok: true as const, value: executed.value.evidence }
+                : {
+                    ok: false as const,
+                    error: projectAnalysisError(executed.error),
+                  };
             } finally {
               let cleanupFailed = false;
               if (sessionId !== undefined) {
@@ -419,20 +432,32 @@ export const registerReverseEngineeringCommands = (
               ? executed.value.evidence
               : projectAnalysisError(executed.error);
           } finally {
-            const closed =
-              sessionId === undefined
-                ? undefined
-                : await manager.close(sessionId);
-            if (closed !== undefined && !closed.ok) {
+            try {
+              if (sessionId !== undefined) {
+                const closed = await manager.close(sessionId);
+                if (!closed.ok)
+                  logger.error(
+                    {
+                      command: CLI_COMMANDS.debugWithRizin,
+                      cleanup: projectAnalysisError(closed.error),
+                    },
+                    "Rizin cleanup failed after collecting command output",
+                  );
+              }
+            } catch (cause) {
               logger.error(
                 {
                   command: CLI_COMMANDS.debugWithRizin,
-                  cleanup: projectAnalysisError(closed.error),
+                  cleanup:
+                    cause instanceof Error
+                      ? cause.message
+                      : "Unknown cleanup failure",
                 },
                 "Rizin cleanup failed after collecting command output",
               );
-              process.exitCode = 1;
             }
+            // The retained owner retries all sessions. Only its final outcome
+            // establishes whether command cleanup remains incomplete.
             await manager.closeAll().catch((cause: unknown) => {
               process.exitCode = 1;
               logger.error(

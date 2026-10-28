@@ -346,11 +346,22 @@ it("represents absent timeline timestamps as unknown and preserves an observed z
           },
         },
         {
+          method: "Network.requestWillBeSent",
+          sessionId: command.sessionId,
+          params: {
+            requestId: "actual-zero-clock-value",
+            type: "Document",
+            frameId: "frame-main",
+            timestamp: 0,
+            request: { url: `${origin}/document`, method: "GET" },
+          },
+        },
+        {
           method: "Network.loadingFailed",
           sessionId: command.sessionId,
           params: {
             requestId: "actual-zero-clock-value",
-            frameId: "frame-main",
+            type: "Document",
             errorText: "net::ERR_CONNECTION_REFUSED",
             timestamp: 0,
           },
@@ -395,3 +406,45 @@ it("ends an armed observation at a fatal protocol failure without waiting out it
     error: { _tag: "BrowserObservationError", reason: "protocol_error" },
   });
 }, 15_000);
+
+it("does not join an empty document request identity to a later loading failure", async () => {
+  const { observation } = await observeDuringClockSampling(
+    (command, origin) => {
+      if (command.method !== "Performance.getMetrics") return undefined;
+      return [
+        {
+          ...laterInWindowRequest(command, origin),
+          params: {
+            ...laterInWindowRequest(command, origin).params,
+            requestId: "",
+          },
+        },
+        {
+          method: "Network.loadingFailed",
+          sessionId: command.sessionId,
+          params: {
+            requestId: "",
+            timestamp: 22,
+            errorText: "net::ERR_FAILED",
+          },
+        },
+      ];
+    },
+  );
+  expect(observation.window.end_reason).toBe("window_elapsed");
+  expect(observation.timeline).toContainEqual(
+    expect.objectContaining({ type: "redirect", request_id: null }),
+  );
+  expect(observation.timeline).not.toContainEqual(
+    expect.objectContaining({ type: "load_failed" }),
+  );
+  expect(observation.timeline).not.toContainEqual(
+    expect.objectContaining({ request_id: "" }),
+  );
+  expect(observation.completeness.excluded).toContainEqual(
+    expect.objectContaining({
+      section: "timeline",
+      reason: "invalid_protocol_value",
+    }),
+  );
+});

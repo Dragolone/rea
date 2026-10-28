@@ -7,7 +7,7 @@ import type {
 } from "@modelcontextprotocol/server";
 import type { PromptCompletionSource } from "./promptCompletion.js";
 import type { RecordedMcpCatalog } from "../recordedMcpCatalog.js";
-import type { ToolResultDelivery } from "./toolResult.js";
+import type { ToolResultDelivery } from "./ToolResultDelivery.js";
 import {
   EvidenceMcpServerCore,
   currentMcpRequestSignal,
@@ -70,7 +70,8 @@ export class DeferredEvidenceMcpServer extends EvidenceMcpServerCore {
       undefined,
       delivery,
       undefined,
-      false,
+      // `main.ts` only defers the exact full advertisement catalog.
+      "full",
       catalog.identity,
     );
     for (const tool of catalog.tools) {

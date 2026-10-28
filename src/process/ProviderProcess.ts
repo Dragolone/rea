@@ -20,6 +20,7 @@ import {
   systemProcessOwnershipHost,
 } from "./ProcessOwnershipObservation.js";
 import { ProcessOwnershipEvidenceOwner } from "./ProcessOwnershipEvidence.js";
+import { mergeEnvironmentOverrides } from "./snapshotEnvironment.js";
 
 const DEFAULT_TERMINATION_GRACE_MS = 250;
 const DEFAULT_KILL_GRACE_MS = 1_000;
@@ -130,6 +131,11 @@ export interface ProviderProcessSnapshot {
   readonly signal: NodeJS.Signals | null | undefined;
   /** Present only when the process tree reached its enforced memory limit. */
   readonly memoryLimitReached?: true;
+  /**
+   * Present once this supervisor began stopping the process, before any signal
+   * it sends. An exit signal observed without it did not come from the owner.
+   */
+  readonly stopRequested?: true;
   /** Present when a provider stream was destroyed before all bytes were observed. */
   readonly outputIncomplete?: true;
 }
@@ -188,12 +194,17 @@ export type ProviderProcessDiagnostic =
       readonly cause?: Error;
     };
 
+/** Aggregate byte budget, or independent retained stdout and stderr byte budgets. */
+export type ProcessDiagnosticBudget =
+  | number
+  | { readonly stdout: number; readonly stderr: number };
+
 /** Options for process lifecycle diagnostics. */
 export interface ProviderProcessSupervisorOptions {
   /** Retain stdout for diagnostics; disable when it carries a parsed protocol. Defaults to true. */
   readonly captureStdout?: boolean;
-  /** Aggregate retained stdout/stderr byte budget; overflow is drained and reported, not retained. */
-  readonly maxDiagnosticBytes?: number;
+  /** Retained output budget; overflow is drained and reported, not retained. */
+  readonly maxDiagnosticBytes?: ProcessDiagnosticBudget;
   /**
    * Single-line token ending at a non-ASCII-word byte or EOF, located before retention
    * applies, so its latest occurrence survives an exhausted budget.
@@ -257,11 +268,18 @@ export const spawnOwnedProviderProcess = async (
     options.signal?.throwIfAborted();
   }
   const hostEnvironment = options.hostEnvironment ?? process.env;
-  const environment = {
-    ...hostEnvironment,
-    ...options.env,
-    REA_PROCESS_RUN_ID: options.runId,
-  };
+  const selectedEnvironment = mergeEnvironmentOverrides(
+    hostEnvironment,
+    options.env ?? {},
+    platform,
+  );
+  // Ownership is the final layer, including when a caller used another casing.
+  // Resolve undefined overrides before the launchers omit unset variables.
+  const environment = mergeEnvironmentOverrides(
+    selectedEnvironment,
+    { REA_PROCESS_RUN_ID: options.runId },
+    platform,
+  );
   if (platform === "win32" && process.platform === "win32") {
     const child = new WindowsOwnedProcess(
       options.command,
@@ -388,8 +406,12 @@ export class ProviderProcessSupervisor {
   };
   #exitObservation: ProviderProcessExitObservation | undefined;
   #stopPromise: Promise<ProviderProcessStopResult> | undefined;
+  #stopRequested = false;
   #disposed = false;
-  #maxDiagnosticBytes: number | undefined;
+  #maxAggregateDiagnosticBytes: number | undefined;
+  readonly #maxStreamDiagnosticBytes:
+    | Exclude<ProcessDiagnosticBudget, number>
+    | undefined;
   #outputEpoch = 0;
 
   constructor(
@@ -397,7 +419,13 @@ export class ProviderProcessSupervisor {
     options: ProviderProcessSupervisorOptions = {},
   ) {
     this.#options = options;
-    this.#maxDiagnosticBytes = options.maxDiagnosticBytes;
+    const budget = options.maxDiagnosticBytes;
+    if (typeof budget === "number") this.#maxAggregateDiagnosticBytes = budget;
+    else if (budget !== undefined)
+      this.#maxStreamDiagnosticBytes = {
+        stdout: budget.stdout,
+        stderr: budget.stderr,
+      };
     this.#resetMarkers();
     if (options.captureStdout !== false)
       this.#attach(launch.process.stdout, "stdout");
@@ -439,6 +467,7 @@ export class ProviderProcessSupervisor {
       ...(this.launch.process.memoryLimitReached === true
         ? { memoryLimitReached: true }
         : {}),
+      ...(this.#stopRequested ? { stopRequested: true } : {}),
       ...(outputIncomplete ? { outputIncomplete: true } : {}),
     };
   }
@@ -586,10 +615,10 @@ export class ProviderProcessSupervisor {
       Number.MAX_SAFE_INTEGER,
       retained + maxBytes,
     );
-    this.#maxDiagnosticBytes =
-      this.#maxDiagnosticBytes === undefined
+    this.#maxAggregateDiagnosticBytes =
+      this.#maxAggregateDiagnosticBytes === undefined
         ? requestedLimit
-        : Math.min(this.#maxDiagnosticBytes, requestedLimit);
+        : Math.min(this.#maxAggregateDiagnosticBytes, requestedLimit);
   }
 
   /** Unreference inherited output pipes without closing streams shared with descendants. */
@@ -608,6 +637,7 @@ export class ProviderProcessSupervisor {
   stop(
     options: ProviderProcessStopOptions = {},
   ): Promise<ProviderProcessStopResult> {
+    this.#stopRequested = true;
     this.#stopPromise ??= this.#stop(options).then((result) => {
       if (result.status === "incomplete") this.#stopPromise = undefined;
       return result;
@@ -789,14 +819,25 @@ export class ProviderProcessSupervisor {
       this.#stderrMarker?.scan(bytes, this.#stderrObservedBytes);
       this.#stderrObservedBytes += bytes.byteLength;
     }
-    const remaining =
-      this.#maxDiagnosticBytes === undefined
+    const aggregateRemaining =
+      this.#maxAggregateDiagnosticBytes === undefined
         ? bytes.byteLength
         : Math.max(
             0,
-            this.#maxDiagnosticBytes - this.#stdout.bytes - this.#stderr.bytes,
+            this.#maxAggregateDiagnosticBytes -
+              this.#stdout.bytes -
+              this.#stderr.bytes,
           );
-    const retained = Math.min(bytes.byteLength, remaining);
+    const streamLimit = this.#maxStreamDiagnosticBytes?.[stream];
+    const streamRemaining =
+      streamLimit === undefined
+        ? bytes.byteLength
+        : Math.max(0, streamLimit - capture.bytes);
+    const retained = Math.min(
+      bytes.byteLength,
+      aggregateRemaining,
+      streamRemaining,
+    );
     if (retained < bytes.byteLength) this.#diagnosticTruncated = true;
     if (retained > 0) capture.append(bytes.subarray(0, retained));
     this.#options.onDiagnostic?.({

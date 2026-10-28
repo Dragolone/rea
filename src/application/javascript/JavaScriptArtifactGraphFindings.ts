@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { posix } from "node:path";
 
 import { compactStringIdentityKey } from "../../domain/compactStringIdentity.js";
 import type { ApplicationNode } from "../../domain/javascript/javascriptApplicationGraphSchemas.js";
@@ -204,6 +205,7 @@ const addReference = (
       ? null
       : resolveReference(context, input.file.path, input.value, input.coverage);
   if (
+    input.value.operation === "load" &&
     (input.value.kind === "static-import" ||
       input.value.kind === "dynamic-import" ||
       input.value.kind === "require") &&
@@ -221,6 +223,7 @@ const addReference = (
     resolved !== null &&
     resolved.path !== null &&
     resolved.file !== null &&
+    input.value.operation === "load" &&
     (input.value.kind === "static-import" ||
       input.value.kind === "dynamic-import" ||
       input.value.kind === "require")
@@ -301,11 +304,17 @@ const addReference = (
     file: input.file,
     range: input.value.location,
     coverage: input.coverage,
-    relation: resolved?.file?.kind === "native-addon" ? "loads" : "imports",
+    relation:
+      input.value.operation === "load" &&
+      resolved?.file?.kind === "native-addon"
+        ? "loads"
+        : "imports",
     properties: {
       kind: input.value.kind,
+      operation: input.value.operation,
       specifier: input.value.specifier,
       expression: input.value.expression,
+      resolution_base_path: input.value.resolution_base_path ?? null,
       resolution_mode:
         input.value.kind === "static-import" ||
         input.value.kind === "dynamic-import" ||
@@ -338,7 +347,9 @@ const addEndpoint = (
   const candidate = input.value.interpretation === "candidate";
   const partial = input.value.resolution === "partial";
   const candidateLimitation =
-    "The unbound method-like argument is only a candidate; its receiver does not establish a network call.";
+    input.value.kind === "route"
+      ? "Only the property name suggests a route; the enclosing object has no router fields."
+      : "The unbound method-like argument is only a candidate; its receiver does not establish a network call.";
   const partialLimitation =
     "The request target is not an exact literal; the endpoint value retains the unresolved source expression.";
   const label = `${input.value.kind} ${candidate ? "endpoint candidate" : "endpoint"}`;
@@ -481,14 +492,16 @@ const addDiscoveredRole = (
   changedRoots: ReadonlySet<string> | null,
 ): void => {
   const root = applicationRootPath(context, input.file);
-  const resolution = resolveArtifactPathByContext({
+  const resolved = resolveArtifactPathByContext({
     declaredPath: input.value.path,
     sourcePath: input.file.path,
     context: input.value.resolution_context,
     files: context.filesByPath,
+    jsonDocuments: context.analysis.jsonDocuments,
     directoryPaths: context.directoryPaths,
     unanalyzedFiles: context.unanalyzedFiles,
-    ...(input.value.role === "preload"
+    ...(input.value.role === "preload" ||
+    input.value.path_base === "source-directory"
       ? { runtimePathKind: "exact-file" as const }
       : input.value.role === "renderer" &&
           input.value.resolution_context === "filesystem-expression"
@@ -508,6 +521,16 @@ const addDiscoveredRole = (
           ? { runtimePathKind: "url-resource" as const }
           : {}),
   });
+  const resolution =
+    input.value.path_base === "source-directory"
+      ? {
+          ...resolved,
+          limitations: [
+            ...resolved.limitations,
+            "The source-directory anchor is inferred from authored code; bundled or transformed runtime path behavior was not verified.",
+          ],
+        }
+      : resolved;
   const role = createElectronRoleNode(context, {
     kind:
       input.value.role === "preload" ? "electron-preload" : "electron-renderer",
@@ -531,7 +554,12 @@ const addDiscoveredRole = (
     range: input.value.location,
     coverage: input.coverage,
     relation: "loads",
-    properties: { mechanism: input.value.mechanism },
+    properties: {
+      mechanism: input.value.mechanism,
+      ...(input.value.path_base === undefined
+        ? {}
+        : { path_base: input.value.path_base }),
+    },
   });
   linkElectronRoleToAsset(context, {
     role,
@@ -554,6 +582,7 @@ const addSourceMapEdge = (
     sourcePath: input.file.path,
     context: "url-reference",
     files: context.filesByPath,
+    jsonDocuments: context.analysis.jsonDocuments,
     directoryPaths: context.directoryPaths,
     unanalyzedFiles: context.unanalyzedFiles,
   });
@@ -630,6 +659,12 @@ const resolveReference = (
   if (specifier === null) return null;
   const isWorker =
     reference.kind === "worker" || reference.kind === "service-worker";
+  const resolutionSourcePath =
+    reference.kind === "require" && reference.resolution_base_path !== undefined
+      ? posix.normalize(
+          posix.join(posix.dirname(sourcePath), reference.resolution_base_path),
+        )
+      : sourcePath;
   const chunk = isWorker
     ? null
     : resolveBundlerChunkReference(context, sourcePath, reference);
@@ -658,14 +693,16 @@ const resolveReference = (
         sourcePath,
         context: "url-reference",
         files: context.filesByPath,
+        jsonDocuments: context.analysis.jsonDocuments,
         directoryPaths: context.directoryPaths,
         unanalyzedFiles: context.unanalyzedFiles,
       })
     : resolveArtifactPathByContext({
         declaredPath: specifier,
-        sourcePath,
+        sourcePath: resolutionSourcePath,
         context: "module-specifier",
         files: context.filesByPath,
+        jsonDocuments: context.analysis.jsonDocuments,
         directoryPaths: context.directoryPaths,
         unanalyzedFiles: context.unanalyzedFiles,
         ...("require" === reference.kind ||
@@ -673,7 +710,7 @@ const resolveReference = (
         "dynamic-import" === reference.kind
           ? {
               moduleKind: moduleResolutionModeForJavaScriptReference(
-                sourcePath,
+                resolutionSourcePath,
                 reference.kind,
               ),
             }

@@ -1,3 +1,11 @@
+import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
+import { ProviderCleanupError } from "../domain/providerCleanupError.js";
+import {
+  assertArtifactCommandPath,
+  type ArtifactCommandPath,
+} from "../process/ArtifactCommandPath.js";
+import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
+import { artifactFileCancellationCause } from "../artifacts/ArtifactFileOperation.js";
 import { randomUUID } from "node:crypto";
 import { fixedAllowanceOptions } from "../domain/fixedAllowanceRemediation.js";
 import { AnalysisError } from "../domain/analysisErrorBase.js";
@@ -39,6 +47,7 @@ export interface PcapCommandCleanup {
 export interface PcapCommandOutput {
   readonly stdout: string;
   readonly stderr: string;
+  readonly invalidUtf8Streams: readonly ("stdout" | "stderr")[];
   readonly cleanup?: PcapCommandCleanup;
 }
 
@@ -57,7 +66,10 @@ export const runPcapCommand = async (options: {
   readonly signal: AbortSignal | undefined;
   readonly inputPath?: string;
   readonly nativeBound?: {
-    readonly limiter?: { command: string; arguments: readonly string[] };
+    readonly limiter?: {
+      command: ArtifactCommandPath;
+      arguments: readonly string[];
+    };
     readonly memoryLimitBytes?: number;
   };
   readonly launcher?: PcapCommandLauncher;
@@ -72,7 +84,6 @@ export const runPcapCommand = async (options: {
   if (signal?.aborted)
     throw new AnalysisCancelledError(operation, { cause: signal.reason });
   const hostEnvironment = {
-    ...process.env,
     ...options.environment,
     LC_ALL: "C",
     LANG: "C",
@@ -91,7 +102,7 @@ export const runPcapCommand = async (options: {
       options.nativeBound?.limiter === undefined
         ? invocation
         : {
-            command: options.nativeBound.limiter.command,
+            command: options.nativeBound.limiter.command.invocationPath,
             arguments: [
               ...options.nativeBound.limiter.arguments,
               invocation.command,
@@ -101,6 +112,9 @@ export const runPcapCommand = async (options: {
     // Native ownership preparation has its own bounded compiler lifecycle;
     // do not spend the tool's execution deadline rebuilding a cold SDK cache.
     await prepareOwnedCommand(signal);
+    const selectedLimiter = options.nativeBound?.limiter?.command;
+    if (selectedLimiter !== undefined)
+      await assertArtifactCommandPath(selectedLimiter, operation, { signal });
     const output = await runOwnedCommand(
       {
         ...boundedInvocation,
@@ -136,13 +150,52 @@ export const runPcapCommand = async (options: {
         },
       },
     );
+    if (selectedLimiter !== undefined)
+      await assertArtifactCommandPath(selectedLimiter, operation, {
+        capturedOutput: {
+          stdout: output.stdout.text,
+          stderr: output.stderr.text,
+          stdout_bytes: output.stdout.bytes,
+          stderr_bytes: output.stderr.bytes,
+          exit_code: output.exitCode ?? null,
+          signal: output.signal ?? null,
+          truncated:
+            output.diagnosticTruncated === true ||
+            output.outputIncomplete === true,
+        },
+      });
     return {
       stdout: output.stdout.text,
       stderr: output.stderr.text,
+      invalidUtf8Streams: [
+        ...(output.stdout.invalidUtf8 === true ? (["stdout"] as const) : []),
+        ...(output.stderr.invalidUtf8 === true ? (["stderr"] as const) : []),
+      ],
       ...(cleanup === undefined ? {} : { cleanup }),
     };
   } catch (cause) {
-    if (cause instanceof AnalysisError) throw cause;
+    if (cause instanceof AnalysisError) {
+      if (cleanup !== undefined) {
+        const pending = new ProviderCleanupError(
+          "pcap",
+          cleanup.resources,
+          {
+            reason: cleanup.reason,
+          },
+          {
+            operation,
+            capturedOutput: cleanup.capturedOutput,
+            cleanup: { reason: cleanup.reason, resources: cleanup.resources },
+          },
+        );
+        throw analysisErrorWithCleanupFailure(cause, pending, operation);
+      }
+      throw cause;
+    }
+    if (cause instanceof ArtifactReaderFailure && cause.reason === "cancelled")
+      throw new AnalysisCancelledError(operation, {
+        cause: artifactFileCancellationCause(cause),
+      });
     if (
       cause instanceof OwnedCommandFailure &&
       cause.cleanupOwner !== undefined
@@ -176,14 +229,16 @@ export const runPcapCommand = async (options: {
             },
           }
         : {}),
-      ...(cause instanceof OwnedCommandFailure && cause.cleanupFailure !== null
-        ? {
-            cleanup: {
-              reason: cause.cleanupFailure,
-              resources: cause.resources,
-            },
-          }
-        : {}),
+      ...(cleanup !== undefined
+        ? { cleanup }
+        : cause instanceof OwnedCommandFailure && cause.cleanupFailure !== null
+          ? {
+              cleanup: {
+                reason: cause.cleanupFailure,
+                resources: cause.resources,
+              },
+            }
+          : {}),
     };
     if (cause instanceof OwnedCommandFailure && cause.reason === "cancelled")
       throw new AnalysisCancelledError(operation, {

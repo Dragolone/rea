@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { utcDateTimeSchema } from "./offsetDateTime.js";
 
 import { webRuntimeCommandTimeoutSchema } from "./browserDeadline.js";
 import {
@@ -12,8 +13,8 @@ import { browserVersionSchema } from "./browserObservationSchemas.js";
 export const observeWebSessionInputSchema = z.strictObject({
   cdp_endpoint: browserObservationEndpointSchema,
   allowed_origins: browserAllowedOriginsSchema,
-  target_id: z.string().trim().min(1),
-  observation_ms: z.number().int().min(1).default(10_000),
+  target_id: z.string().min(1),
+  observation_ms: z.int().min(1).default(10_000),
   command_timeout_ms: webRuntimeCommandTimeoutSchema,
 });
 export type ObserveWebSessionInput = z.infer<
@@ -21,7 +22,7 @@ export type ObserveWebSessionInput = z.infer<
 >;
 
 const timelineEventSchema = z.object({
-  sequence: z.number().int().min(1),
+  sequence: z.int().min(1),
   type: z.enum([
     "navigation_requested",
     "navigation_committed",
@@ -60,9 +61,9 @@ export const webObservationSessionSchema = z.object({
     final_url: z.string().nullable(),
   }),
   window: z.object({
-    armed_at: z.iso.datetime(),
-    ended_at: z.iso.datetime(),
-    requested_ms: z.number().int().min(1),
+    armed_at: utcDateTimeSchema,
+    ended_at: utcDateTimeSchema,
+    requested_ms: z.int().min(1),
     end_reason: z.enum([
       "window_elapsed",
       "target_left_scope",

@@ -22,6 +22,7 @@ import {
   buildNativePeFixture,
 } from "../../../src/dotnet/ManagedPe.fixture.js";
 import { readManagedMetadataLayout } from "../../../src/dotnet/ManagedMetadataLayout.js";
+import { readManagedPeLayout } from "../../../src/dotnet/ManagedPeReader.js";
 import { readAssemblyReference } from "../../../src/dotnet/ManagedMetadataInventoryRows.js";
 import {
   CPU,
@@ -29,8 +30,10 @@ import {
   fatImage,
   machoImage,
 } from "../../../src/artifacts/apple/MachoImage.fixture.js";
+import { locateGodotPck } from "../../../src/artifacts/GodotPckLocation.js";
 import { DirectoryArtifactReader } from "../../../src/artifacts/DirectoryArtifactReader.js";
 import { ArtifactReaderFailure } from "../../../src/artifacts/ArtifactReader.js";
+import { artifactFilePrimaryFacts } from "../../../src/artifacts/ArtifactFileOperation.js";
 import { DesktopApplicationReader } from "../../../src/artifacts/DesktopApplicationReader.js";
 import { DesktopApplicationService } from "../../../src/application/artifacts/DesktopApplicationService.js";
 
@@ -52,6 +55,113 @@ const put = async (root: string, path: string, bytes: Buffer | string) => {
   await mkdir(join(destination, ".."), { recursive: true });
   await writeFile(destination, bytes);
 };
+
+it.each(["NE", "LE", "LX", "PE\0\0"])(
+  "admits the MZ signature before interpreting a trailing %j header as PE",
+  async (signature) => {
+    const root = await createTestTempDirectory("rea-desktop-mz-signature-");
+    const bytes = Buffer.alloc(64 + signature.length);
+    bytes.write("MZ");
+    bytes.writeUInt16LE(4, 8);
+    bytes.writeUInt32LE(64, 60);
+    bytes.write(signature, 64, "latin1");
+    await put(root, "legacy.exe", bytes);
+
+    const { report } = await inspect(root);
+    const file = report.files.find((row) => row.path === "legacy.exe");
+    expect(file?.facts).toEqual([]);
+    expect(file?.issues).toEqual(
+      signature.startsWith("PE") ? ["PE COFF header is truncated"] : [],
+    );
+    expect(file?.ranges).toContainEqual({
+      offset: 64,
+      bytes: signature.length,
+      sha256: expect.any(String),
+    });
+  },
+);
+
+it.each(["oversized-header", "prefix-only-section"] as const)(
+  "keeps desktop CLR prefix admission distinct from full managed admission: %s",
+  async (mode) => {
+    const original = buildManagedPeFixture({
+      references: ["UnityEngine.CoreModule"],
+    });
+    expect(readManagedPeLayout(original).cli).not.toBeNull();
+    let image = Buffer.from(original);
+    if (mode === "oversized-header") {
+      // The directory declares 72 bytes; desktop needs only cb >= 72.
+      image.writeUInt32LE(73, 0x200);
+    } else {
+      // Metadata remains in .text; a second section backs only the CLI prefix.
+      image = Buffer.concat([original, original.subarray(0x200, 0x210)]);
+      const coff = image.readUInt32LE(0x3c) + 4;
+      const optional = coff + 20;
+      const secondSection = optional + image.readUInt16LE(coff + 16) + 40;
+      image.writeUInt16LE(2, coff + 2);
+      image.writeUInt32LE(0x900000, optional + 96 + 14 * 8);
+      image.write(".cli", secondSection, "ascii");
+      image.writeUInt32LE(16, secondSection + 8);
+      image.writeUInt32LE(0x900000, secondSection + 12);
+      image.writeUInt32LE(16, secondSection + 16);
+      image.writeUInt32LE(original.length, secondSection + 20);
+    }
+    expect(readManagedPeLayout(image)).toMatchObject({
+      cli: null,
+      cliIssue: {
+        code:
+          mode === "oversized-header"
+            ? "invalid-cli-header"
+            : "invalid-directory",
+        scope: "cli.header",
+      },
+    });
+    const root = await createTestTempDirectory("rea-desktop-clr-prefix-");
+    const path = "Game_Data/Managed/Assembly-CSharp.dll";
+    await put(root, path, image);
+    const { report } = await inspect(root);
+    const file = report.files.find((row) => row.path === path);
+    expect(file?.issues).toEqual([]);
+    expect(file?.facts).toContainEqual({
+      kind: "unity-assembly-reference",
+      offset: expect.any(Number),
+      value: {
+        name: "UnityEngine.CoreModule",
+        token: expect.any(String),
+        managed_directory: "Game_Data/Managed",
+      },
+    });
+  },
+);
+
+it.skipIf(process.platform !== "linux")(
+  "keeps desktop sibling files with partial coverage for invalid UTF-8 names",
+  async () => {
+    const root = await createTestTempDirectory("rea-desktop-filename-bytes-");
+    const rawName = Buffer.from([
+      0x62, 0x61, 0x64, 0xff, 0x2e, 0x74, 0x78, 0x74,
+    ]);
+    const rawPath = Buffer.concat([Buffer.from(`${root}/`), rawName]);
+    await Promise.all([
+      writeFile(rawPath, "RAW_FILE"),
+      writeFile(join(root, "bad\ufffd.txt"), "UNICODE_FILE"),
+      writeFile(join(root, "good.txt"), "GOOD_FILE"),
+    ]);
+
+    const { report } = await inspect(root);
+    expect(report.coverage).toMatchObject({
+      status: "partial",
+      entries_examined: 3,
+    });
+    expect(
+      report.files.filter(({ path }) => path === "bad\ufffd.txt"),
+    ).toHaveLength(1);
+    expect(report.files.map(({ path }) => path)).toContain("good.txt");
+    expect(report.limitations.join(" ")).toContain(
+      `First raw basename bytes: ${rawName.toString("hex")}`,
+    );
+  },
+);
 
 it("joins real PE/CLI reference facts and independent engine markers without picking a winner", async () => {
   const root = await createTestTempDirectory("rea-desktop-mixed-");
@@ -113,13 +223,13 @@ it("joins real PE/CLI reference facts and independent engine markers without pic
     expect(probe.path).toBe(
       join(await realpath(root), files.get(probe.file_id)!.path),
     );
-  const summary = inspectAnalysisView({
+  const summary = await inspectAnalysisView({
     source: { kind: "inline", evidence },
     view: { kind: "summary" },
   });
   if (!summary.ok) throw summary.error;
   expect(JSON.stringify(summary.value)).not.toContain('"files":[');
-  const selected = inspectAnalysisView({
+  const selected = await inspectAnalysisView({
     source: { kind: "inline", evidence },
     view: {
       kind: "desktop-application",
@@ -163,6 +273,8 @@ it("reads sparse embedded PCK ranges without hashing or retaining a large execut
   pck.write("GDPC");
   pck.writeUInt32LE(3, 4);
   pck.writeUInt32LE(4, 8);
+  pck.writeUInt32LE(0x80000001, 12);
+  pck.writeUInt32LE(0xffffffff, 16);
   const trailer = Buffer.alloc(12);
   trailer.writeBigUInt64LE(BigInt(pck.length));
   trailer.write("GDPC", 8);
@@ -174,10 +286,65 @@ it("reads sparse embedded PCK ranges without hashing or retaining a large execut
   expect(report.candidates.map((row) => row.family)).toContain("godot");
   expect(report.coverage.bytes_read).toBeLessThan(4096);
   expect(report.files[0]?.bytes).toBe(size);
-  expect(report.files[0]?.facts).toContainEqual(
-    expect.objectContaining({ kind: "godot-pck-header", offset: size - 32 }),
-  );
+  expect(report.files[0]?.facts).toContainEqual({
+    kind: "godot-pck-header",
+    offset: size - 32,
+    value: {
+      pack_version: 3,
+      engine_version: [4, 0x80000001, 0xffffffff],
+      placement: "embedded-trailer",
+    },
+  });
 });
+
+it.each([4, 19, 20])(
+  "keeps PCK location separate from desktop header admission for %i-byte packs",
+  async (packBytes) => {
+    const root = await createTestTempDirectory("rea-desktop-pck-minimum-");
+    const path = join(root, "game.exe");
+    const carrier = Buffer.alloc(64);
+    carrier.set([0x7f, 0x45, 0x4c, 0x46]);
+    const pack = Buffer.alloc(packBytes);
+    pack.write("GDPC");
+    const trailer = Buffer.alloc(12);
+    trailer.writeBigUInt64LE(BigInt(packBytes));
+    trailer.write("GDPC", 8);
+    const bytes = Buffer.concat([carrier, pack, trailer]);
+    await writeFile(path, bytes);
+    const handle = await open(path, "r");
+    try {
+      expect(await locateGodotPck(handle, bytes.length)).toEqual({
+        start: carrier.length,
+        end: carrier.length + packBytes,
+        embedded: true,
+      });
+    } finally {
+      await handle.close();
+    }
+    const { report } = await inspect(root);
+    const file = report.files.find((row) => row.path === "game.exe");
+    expect(file).toBeDefined();
+    if (packBytes < 20) {
+      expect(file?.issues).toContain(
+        "Embedded PCK trailer declares an invalid pack extent",
+      );
+      expect(file?.facts.some((fact) => fact.kind === "godot-pck-header")).toBe(
+        false,
+      );
+    } else {
+      expect(file?.issues).toEqual([]);
+      expect(file?.facts).toContainEqual({
+        kind: "godot-pck-header",
+        offset: carrier.length,
+        value: {
+          pack_version: 0,
+          engine_version: [0, 0, 0],
+          placement: "embedded-trailer",
+        },
+      });
+    }
+  },
+);
 
 it("does not promote filenames, arbitrary pak files or symlink targets into byte facts", async () => {
   const root = await createTestTempDirectory("rea-desktop-unknown-");
@@ -203,7 +370,7 @@ it("retains bounded coverage and stable pages without claiming absence after a t
     entries_examined: 2,
   });
   expect(report.files).toHaveLength(2);
-  const result = inspectAnalysisView({
+  const result = await inspectAnalysisView({
     source: { kind: "inline", evidence },
     view: {
       kind: "desktop-application",
@@ -497,7 +664,7 @@ it.skipIf(process.platform === "win32").each(["path", "kind"] as const)(
       files_probed: 0,
       bytes_read: 0,
     });
-    const page = inspectAnalysisView({
+    const page = await inspectAnalysisView({
       source: { kind: "inline", evidence: after.evidence },
       view: {
         kind: "desktop-application",
@@ -608,6 +775,164 @@ it("preserves the selected root alias and directs follow-ups to the admitted phy
   }
 });
 
+it.each(
+  ["physical read", "format"].flatMap((variant) =>
+    ["unavailable", "mismatch"].map((validationState) => ({
+      variant,
+      validationState,
+    })),
+  ),
+)(
+  "keeps $variant failure through $validationState final validation while discarding unverified desktop byte facts",
+  async ({ variant, validationState }) => {
+    const root = await createTestTempDirectory(
+      "rea-desktop-failed-validation-",
+    );
+    const header = Buffer.alloc(20);
+    header.write("GDPC");
+    header.writeUInt32LE(2, 4);
+    header.writeUInt32LE(4, 8);
+    await put(root, "game.pck", header);
+    const primary =
+      variant === "physical read"
+        ? Object.assign(new Error("physical read denied"), { code: "EACCES" })
+        : new ArtifactReaderFailure(
+            "format",
+            "invalid later format declaration",
+          );
+    const validation = Object.assign(
+      new Error("final descriptor stat failed"),
+      { code: "EIO" },
+    );
+    let observed: unknown;
+    const service = new DesktopApplicationService(
+      new DesktopApplicationReader((path) => {
+        const reader = new DirectoryArtifactReader(path);
+        const inspectFile = reader.inspectFile.bind(reader);
+        reader.inspectFile = (entry, inspect, signal) =>
+          inspectFile(
+            entry,
+            async (file) => {
+              await inspect(file);
+              if (validationState === "unavailable")
+                vi.spyOn(file, "stat").mockRejectedValueOnce(validation);
+              else {
+                const changed = await file.stat({ bigint: true });
+                changed.ino += 1n;
+                vi.spyOn(file, "stat").mockResolvedValueOnce(changed);
+              }
+              if (variant === "physical read") {
+                vi.spyOn(file, "read").mockRejectedValueOnce(primary);
+                await file.read(Buffer.alloc(4), 0, 4, 0);
+              }
+              throw primary;
+            },
+            signal,
+          ).catch((cause: unknown) => {
+            observed = cause;
+            throw cause;
+          });
+        return reader;
+      }),
+    );
+    try {
+      const result = await service.inspect({ path: root });
+      expect(observed).toMatchObject({
+        reason: validationState === "unavailable" ? "io" : "integrity",
+      });
+      if (validationState === "unavailable")
+        expect((observed as ArtifactReaderFailure).cause).toMatchObject({
+          errors: [primary, validation],
+        });
+      else expect((observed as ArtifactReaderFailure).cause).toBe(primary);
+      if (!result.ok) throw result.error;
+      const report = desktopApplicationSchema.parse(
+        result.value.normalized_result,
+      );
+      expect(report.coverage.status).toBe("partial");
+      expect(report.files[0]).toMatchObject({
+        read_status: "unavailable",
+        ranges: [],
+      });
+      expect(
+        report.files[0]?.facts.filter((fact) => fact.offset !== null),
+      ).toEqual([]);
+      expect(report.files[0]?.issues.join(" ")).toContain(primary.message);
+      expect(report.files[0]?.issues.join(" ")).toContain(
+        validationState === "unavailable"
+          ? validation.message
+          : "Directory entry changed during inspection",
+      );
+      expect(report.candidates).toEqual([]);
+    } finally {
+      await service.close();
+      vi.restoreAllMocks();
+    }
+  },
+);
+
+it.each([false, true])(
+  "preserves a physical desktop read failure when cancellation arrives during final validation (failed close: %s)",
+  async (failedClose) => {
+    const root = await createTestTempDirectory(
+      "rea-desktop-read-final-validation-",
+    );
+    await put(root, "game.pck", Buffer.from("completed source prefix"));
+    const reader = new DirectoryArtifactReader(root);
+    const entries = [];
+    for await (const entry of reader.entries()) entries.push(entry);
+    const controller = new AbortController();
+    const reason = { phase: "after physical read failure" };
+    const physical = Object.assign(new Error("physical read denied"), {
+      code: "EACCES",
+    });
+    let fileHandle: Awaited<ReturnType<typeof open>> | undefined;
+    let denyClose = failedClose;
+    try {
+      const failure: unknown = await reader
+        .inspectFile(
+          entries[0]!,
+          async (file) => {
+            fileHandle = file;
+            const stat = file.stat.bind(file);
+            file.stat = ((...args: Parameters<typeof file.stat>) => {
+              controller.abort(reason);
+              return stat(...args);
+            }) as typeof file.stat;
+            const close = file.close.bind(file);
+            file.close = async () => {
+              if (denyClose) throw new Error("desktop descriptor close denied");
+              await close();
+            };
+            vi.spyOn(file, "read").mockRejectedValueOnce(physical);
+            await file.read(Buffer.alloc(4), 0, 4, 0);
+          },
+          controller.signal,
+        )
+        .catch((cause: unknown) => cause);
+      expect(controller.signal.reason).toBe(reason);
+      expect(failure).toMatchObject({ reason: "io" });
+      const primary = artifactFilePrimaryFacts(failure).cause;
+      if (failedClose) expect(primary).toBe(physical);
+      else expect(primary).toMatchObject({ cause: physical });
+      if (failedClose) {
+        expect(failure).toMatchObject({
+          cleanup: { resources: [entries[0]!.adapterKey] },
+        });
+        await expect(reader.close()).rejects.toBeDefined();
+        expect(fileHandle!.fd).toBeGreaterThanOrEqual(0);
+      }
+      denyClose = false;
+      await reader.close();
+      expect(fileHandle!.fd).toBe(-1);
+    } finally {
+      denyClose = false;
+      await reader.close();
+      vi.restoreAllMocks();
+    }
+  },
+);
+
 it.each([false, true])(
   "retains verified header facts and exact release authority when file close fails (late cancellation: %s)",
   async (cancelDuringClose) => {
@@ -708,15 +1033,16 @@ it.each([
       metadataOffset,
       image.length - metadataOffset,
     );
+    if (layout.blob === null)
+      throw new Error("Fixture requires a #Blob stream");
+    const blobSize = layout.blob.size;
     const reference = layout.table(35)!;
     // ECMA-335 AssemblyRef: 8 version bytes, 4 flag bytes, then PublicKeyOrToken.
     // Keep its name valid while making that unrelated blob index invalid.
     if (layout.blobIndexSize === 2)
       image.writeUInt16LE(0xffff, reference.offset + 12);
     else image.writeUInt32LE(0xffff_ffff, reference.offset + 12);
-    expect(() =>
-      readAssemblyReference(image, layout, 1, layout.blob.size),
-    ).toThrow();
+    expect(() => readAssemblyReference(image, layout, 1, blobSize)).toThrow();
     await put(root, `${managedDirectory}/Assembly-CSharp.dll`, image);
     const { report } = await inspect(root);
     expect(report.candidates.map((candidate) => candidate.family)).toEqual([
@@ -783,6 +1109,38 @@ it.each([
         .find((file) => file.path === "data.win")
         ?.facts.some((fact) => fact.kind === "gamemaker-form-header"),
     ).toBe(valid);
+    expect(report.coverage.status).toBe("complete-within-scan");
+  },
+);
+
+it.each(["assets/game.unx", "Example.app/Contents/Resources/game.ios"])(
+  "probes the GameMaker data file at %s",
+  async (path) => {
+    const root = await createTestTempDirectory("rea-desktop-gamemaker-data-");
+    const form = Buffer.alloc(16);
+    form.write("FORM");
+    form.writeUInt32LE(8, 4);
+    form.write("GEN8", 8);
+    form.writeUInt32LE(0, 12);
+    await put(root, path, form);
+
+    const { report } = await inspect(root);
+    expect(report.candidates.map((candidate) => candidate.family)).toContain(
+      "gamemaker",
+    );
+    expect(report.files).toContainEqual(
+      expect.objectContaining({
+        path,
+        read_status: "examined",
+        facts: [
+          expect.objectContaining({
+            kind: "gamemaker-form-header",
+            offset: 0,
+            value: { container: "FORM", first_chunk: "GEN8" },
+          }),
+        ],
+      }),
+    );
     expect(report.coverage.status).toBe("complete-within-scan");
   },
 );
@@ -999,7 +1357,7 @@ it("bounds diagnostic previews while preserving complete caller-provided issue f
     source,
     evidence.provider,
   );
-  const summarized = inspectAnalysisView({
+  const summarized = await inspectAnalysisView({
     source: { kind: "inline", evidence: callerEvidence },
     view: { kind: "summary" },
   });
@@ -1024,7 +1382,7 @@ it("bounds diagnostic previews while preserving complete caller-provided issue f
     },
   });
   for (const ids of [undefined, []]) {
-    const selected = inspectAnalysisView({
+    const selected = await inspectAnalysisView({
       source: { kind: "inline", evidence: callerEvidence },
       view: {
         kind: "desktop-application",

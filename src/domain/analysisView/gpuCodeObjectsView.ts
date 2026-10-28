@@ -4,7 +4,7 @@ import { z } from "zod";
 import {
   gpuCodeObjectsSchema,
   gpuCodeObjectsObjectSchema,
-  gpuCodeObjectsSelectionSchema,
+  gpuCodeObjectsSelectionSchemas,
   gpuObjectSchema,
   gpuKernelSchema,
   gpuTargetSchema,
@@ -18,7 +18,7 @@ import type {
   UnsignedAnalysisView,
 } from "./analysisView.js";
 import { analysisViewInputError } from "./analysisViewErrors.js";
-import { parseAnalysisViewResult } from "./analysisViewParent.js";
+import { createAnalysisViewResultReader } from "./analysisViewParent.js";
 import {
   boundedViewMessages,
   completeWithinViewCoverage,
@@ -31,16 +31,16 @@ import { AnalysisResourceConstraintError } from "../analysisErrorCore.js";
 export const gpuCodeObjectsViewRequestSchema = z.discriminatedUnion(
   "collection",
   [
-    gpuCodeObjectsSelectionSchema.options[0].extend({
+    gpuCodeObjectsSelectionSchemas.objects.extend({
       kind: z.literal("gpu-code-objects"),
     }),
-    gpuCodeObjectsSelectionSchema.options[1].extend({
+    gpuCodeObjectsSelectionSchemas.kernels.extend({
       kind: z.literal("gpu-code-objects"),
     }),
-    gpuCodeObjectsSelectionSchema.options[2].extend({
+    gpuCodeObjectsSelectionSchemas.ptx.extend({
       kind: z.literal("gpu-code-objects"),
     }),
-    gpuCodeObjectsSelectionSchema.options[3].extend({
+    gpuCodeObjectsSelectionSchemas.targets.extend({
       kind: z.literal("gpu-code-objects"),
     }),
   ],
@@ -58,16 +58,24 @@ export const gpuCodeObjectsSummarySchema = gpuCodeObjectsObjectSchema
   });
 export const gpuCodeObjectsItemsSchema = z.union([
   z.array(
-    gpuObjectSchema.partial().required({
-      id: true,
-      kind: true,
-      target: true,
-      location: true,
-      metadata_location: true,
-      payload_target: true,
-      target_consistency: true,
-      inspection: true,
-    }),
+    gpuObjectSchema
+      .partial()
+      .required({
+        id: true,
+        kind: true,
+        target: true,
+        location: true,
+        metadata_location: true,
+        payload_target: true,
+        target_consistency: true,
+        inspection: true,
+      })
+      .extend({
+        // Source defaults qualify historical full rows, never omitted page columns.
+        amd_target_metadata: gpuObjectSchema.shape.amd_target_metadata
+          .removeDefault()
+          .optional(),
+      }),
   ),
   z.array(
     gpuKernelSchema.partial().required({
@@ -160,22 +168,16 @@ type CheckedGpu = {
 };
 // Evidence owns this immutable snapshot. Collection eviction releases the indexes as well.
 const checkedGpu = new WeakMap<object, CheckedGpu>();
+const readReport = createAnalysisViewResultReader(gpuCodeObjectsSchema);
 const readGpuFacts = (
   parent: AnalysisViewParent,
 ): Result<CheckedGpu, AnalysisError> => {
-  const key = parent.normalizedResult;
-  const reusable =
-    parent.sealedResult === true &&
-    key !== null &&
-    typeof key === "object" &&
-    isImmutableJsonSnapshot(key);
-  let checked = reusable ? checkedGpu.get(key) : undefined;
+  const parsed = readReport(parent);
+  if (!parsed.ok) return parsed;
+  const report = parsed.value;
+  const reusable = isImmutableJsonSnapshot(report);
+  let checked = reusable ? checkedGpu.get(report) : undefined;
   if (checked === undefined) {
-    const parsed = parseAnalysisViewResult(gpuCodeObjectsSchema, parent);
-    if (!parsed.ok) return parsed;
-    const report = reusable
-      ? (key as z.infer<typeof gpuCodeObjectsSchema>)
-      : parsed.value;
     const { objects, kernels, ptx_artifacts, ...context } = report;
     const targets = new Set(
       objects.flatMap((row) => (row.target === null ? [] : [row.target])),
@@ -197,12 +199,12 @@ const readGpuFacts = (
           .map((target) => target.slice(0, 256)),
       },
     };
-    if (reusable) checkedGpu.set(key, checked);
+    if (reusable) checkedGpu.set(report, checked);
   }
+  const subject = parent.subject;
   if (
-    parent.subject != null &&
-    (parent.subject.local_path !== checked.report.artifact.path ||
-      parent.subject.digest.sha256 !== checked.report.artifact.sha256)
+    subject != null &&
+    subject.digest.sha256 !== checked.report.artifact.sha256
   )
     return err(
       analysisViewInputError([
@@ -344,17 +346,19 @@ export const projectGpuCodeObjectsView = (
       : view.collection === "targets"
         ? targetRows
         : report.kernels;
+  const matchesTarget = (row: (typeof rows)[number]): boolean => {
+    if (targets === undefined) return true;
+    const target =
+      "target" in row ? row.target : byId.get(row.object_id)?.target;
+    return target !== null && target !== undefined && targets.has(target);
+  };
   const matches = rows.filter(
     (row) =>
       (ids === undefined || ids.has(row.id)) &&
       (objectIds === undefined ||
         ("object_id" in row && objectIds.has(row.object_id))) &&
       (names === undefined || ("name" in row && names.has(row.name))) &&
-      (targets === undefined ||
-        targets.has(
-          ("target" in row ? row.target : byId.get(row.object_id)?.target) ??
-            "",
-        )),
+      matchesTarget(row),
   );
   const defaults =
     view.collection === "kernels"

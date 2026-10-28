@@ -1,13 +1,23 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import type { BinaryTarget } from "../../src/domain/binaryTargetTypes.js";
+import type {
+  BinaryTarget,
+  HeaderArchitecture,
+} from "../../src/domain/binaryTargetTypes.js";
 import type { InspectSignature } from "../../src/domain/native/nativeInspection.js";
 import { ok } from "../../src/domain/result.js";
 import type {
   NativeCommandCapture,
   NativeCommandOptions,
   NativeCommandRunner,
+  ResolvedTool,
 } from "../../src/native/CommandRunner.js";
+
+/** Resolver seam for fixtures with identical invocation and physical paths. */
+export const nativeResolvedToolFixture = (
+  path: string,
+  sha256: string,
+): ResolvedTool => ({ invocationPath: path, resolvedPath: path, sha256 });
 
 /** Replay captured native command outputs through the production runner seam. */
 export class NativeFixtureRunner implements NativeCommandRunner {
@@ -106,6 +116,7 @@ export const nativeMachoTarget = (
 ): BinaryTarget & {
   readonly kind: "executable";
   readonly format: "mach-o";
+  readonly architecture: HeaderArchitecture;
 } => ({
   path,
   ...(sourcePath === undefined ? {} : { sourcePath }),

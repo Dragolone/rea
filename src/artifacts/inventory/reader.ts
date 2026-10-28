@@ -1,14 +1,12 @@
-import { AsarArtifactReader } from "../AsarArtifactReader.js";
+import type { GodotPckAdmission } from "../GodotPckLocation.js";
+import type { PyInstallerAdmission } from "../pyinstaller/PyInstallerAdmission.js";
+import type { NodeSeaAdmission } from "../nodeSea/NodeSeaAdmission.js";
+import type { AsarHeaderAdmission } from "../../config/asarHeaderAdmission.js";
 import type {
   ArtifactReader,
   ArtifactReaderTraversal,
 } from "../ArtifactReader.js";
-import { DirectoryArtifactReader } from "../DirectoryArtifactReader.js";
-import { GodotPckArtifactReader } from "../GodotPckArtifactReader.js";
-import { MachOSliceArtifactReader } from "../MachOSliceArtifactReader.js";
-import { NativeDmgArtifactReader } from "../NativeDmgArtifactReader.js";
-import { PyInstallerArtifactReader } from "../PyInstallerArtifactReader.js";
-import { ZipArtifactReader } from "../ZipArtifactReader.js";
+import { createArtifactReader } from "../createArtifactReader.js";
 import type {
   ArtifactInventoryCoverage,
   ArtifactOccurrence,
@@ -23,29 +21,26 @@ export const createReader = (
   path: string,
   format: ArtifactOccurrence["artifact_format"],
   environment: Readonly<NodeJS.ProcessEnv>,
-  rootSource?: StableRegularFileDescriptor,
+  readerAdmission?:
+    | StableRegularFileDescriptor
+    | NodeSeaAdmission
+    | PyInstallerAdmission
+    | GodotPckAdmission,
+  asarHeaderAdmission?: AsarHeaderAdmission,
+  selectedPath?: string,
 ): ArtifactReader | undefined => {
-  if (isZipPackageFormat(format))
-    return new ZipArtifactReader(path, format, undefined, rootSource);
-  switch (format) {
-    case "directory":
-      return new DirectoryArtifactReader(path);
-    case "asar":
-      return new AsarArtifactReader(path);
-    case "pyinstaller":
-      return new PyInstallerArtifactReader(path, rootSource);
-    case "godot-pck":
-      return new GodotPckArtifactReader(path, rootSource);
-    case "mach-o-universal":
-      return process.platform === "darwin"
-        ? new MachOSliceArtifactReader(path, environment, undefined, rootSource)
-        : undefined;
-    case "dmg":
-      if (process.platform !== "darwin") return undefined;
-      return new NativeDmgArtifactReader(path, environment);
-    default:
-      return undefined;
-  }
+  if (
+    (format === "mach-o-universal" || format === "dmg") &&
+    process.platform !== "darwin"
+  )
+    return undefined;
+  return createArtifactReader(path, format, {
+    environment,
+    unreadableDirectories: "omit",
+    admission: readerAdmission,
+    asarHeaderAdmission,
+    selectedPath,
+  });
 };
 
 /** Decide traversal scope and availability once, independently of diagnostic wording. */
@@ -67,6 +62,16 @@ export const inventoryCoverage = (
         ...(reader.format === "godot-pck"
           ? [
               "PCK inventory establishes packaged bytes and metadata; scenes, binary resources, GDScript bytecode and runtime signal behavior were not decoded.",
+            ]
+          : []),
+        ...(reader.format === "node-sea"
+          ? [
+              "Node SEA inventory establishes the injected blob, flags, fuse sentinel, main script, optional code cache, snapshot, and assets. V8 snapshots and code cache are not deserialized, and the application is not executed.",
+            ]
+          : []),
+        ...(reader.format === "intel-hex" || reader.format === "srec"
+          ? [
+              "Intel HEX/S-record inventory decodes data records into address-contiguous regions. It does not establish CPU, byte order, memory map, or that a declared start address is executable; gaps are unwritten, not zero.",
             ]
           : []),
         ...traversal.limitations,
@@ -91,7 +96,10 @@ export const inventoryCoverage = (
     isZipPackageFormat(format) ||
     format === "directory" ||
     format === "asar" ||
-    format === "godot-pck"
+    format === "godot-pck" ||
+    format === "node-sea" ||
+    format === "intel-hex" ||
+    format === "srec"
   )
     return {
       coverage: { scope: "container-entries", status: "unknown" },
@@ -99,6 +107,8 @@ export const inventoryCoverage = (
     };
   return {
     coverage: { scope: "root", status: "complete" },
-    limitations: ["Artifact has no child container entries."],
+    limitations: [
+      "Inventory covers root bytes only; child container entries were not examined.",
+    ],
   };
 };

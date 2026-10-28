@@ -88,11 +88,109 @@ export const pyInstallerEntryMetadataSchema = z.strictObject({
 export type PyInstallerEntryMetadata = z.infer<
   typeof pyInstallerEntryMetadataSchema
 >;
+
+/**
+ * Node.js single-executable blob facts. Lengths follow the Node 24 64-bit
+ * little-endian `size_t` reader. The fuse sentinel is a separate carrier scan.
+ */
+export const nodeSeaMetadataSchema = z.strictObject({
+  kind: z.literal("node-sea"),
+  magic: z.literal(0x143da20),
+  flags: uint32,
+  disable_experimental_sea_warning: z.boolean(),
+  use_snapshot: z.boolean(),
+  use_code_cache: z.boolean(),
+  include_assets: z.boolean(),
+  include_exec_argv: z.boolean(),
+  exec_argv_extension: z.enum(["none", "env", "cli"]),
+  exec_argv: z.array(z.string()),
+  code_path: z.string(),
+  carrier: z.enum(["mach-o", "elf", "pe"]),
+  blob_offset: offset,
+  blob_length: offset,
+  fuse_state: z.enum(["set", "unset", "absent", "conflicting"]),
+  fuse_sentinel: z.string().nullable(),
+  fuse_contradiction: z.string().nullable(),
+});
+export type NodeSeaMetadata = z.infer<typeof nodeSeaMetadataSchema>;
+
+/** One injected script, snapshot, code cache, or asset. Bytes stay opaque. */
+export const nodeSeaEntryMetadataSchema = z.strictObject({
+  kind: z.literal("node-sea-entry"),
+  role: z.enum(["main-script", "snapshot", "code-cache", "asset"]),
+  source_path: z.string(),
+  index: uint32,
+});
+
+/**
+ * Intel HEX or Motorola S-record facts derived from every record. Start
+ * addresses are declared values, not proven entry points.
+ */
+export const hexRecordsMetadataSchema = z.strictObject({
+  kind: z.literal("hex-records"),
+  encoding: z.enum(["intel-hex", "srec"]),
+  variant: z
+    .enum(["I8HEX", "I16HEX", "I32HEX", "S19", "S28", "S37", "mixed"])
+    .nullable(),
+  line_count: offset,
+  record_count: offset,
+  data_record_count: offset,
+  data_bytes: offset,
+  duplicate_bytes: offset,
+  region_count: offset,
+  lowest_address: uint32.nullable(),
+  highest_address: uint32.nullable(),
+  termination: z.enum(["present", "absent"]),
+  start_address: uint32.nullable(),
+  start_address_record: z.enum(["05", "S7", "S8", "S9"]).nullable(),
+  start_segment_cs: uint32.nullable(),
+  start_segment_ip: uint32.nullable(),
+  header_hex: z
+    .string()
+    .regex(/^(?:[0-9a-f]{2}){0,252}$/u)
+    .nullable(),
+  header_text: z.string().nullable(),
+  declared_data_record_count: uint32.nullable(),
+});
+export type HexRecordsMetadata = z.infer<typeof hexRecordsMetadataSchema>;
+
+/** One address-contiguous region; lines span its contributing data records. */
+export const hexRecordRegionMetadataSchema = z.strictObject({
+  kind: z.literal("hex-record-region"),
+  start_address: uint32,
+  end_address: uint32,
+  length: offset,
+  record_count: offset,
+  first_line: offset,
+  last_line: offset,
+});
+export type HexRecordRegionMetadata = z.infer<
+  typeof hexRecordRegionMetadataSchema
+>;
+/** Runtime member identity, independent of blob layout and directory order. */
+export const nodeSeaEntryDeclaration = (
+  metadata: z.infer<typeof nodeSeaEntryMetadataSchema>,
+) => ({ role: metadata.role, source_path: metadata.source_path });
+
+/** Declaration identity that is stable across archive layout changes. */
+export const pyInstallerEntryDeclaration = (
+  metadata: PyInstallerEntryMetadata,
+) => ({
+  container: metadata.container,
+  container_name: metadata.container_name,
+  source_name: metadata.source_name,
+  type_code: metadata.type_code,
+});
+
 export const artifactFormatMetadataSchema = z.discriminatedUnion("kind", [
   godotPckMetadataSchema,
   godotPckEntryMetadataSchema,
   pyInstallerMetadataSchema,
   pyInstallerEntryMetadataSchema,
+  nodeSeaMetadataSchema,
+  nodeSeaEntryMetadataSchema,
+  hexRecordsMetadataSchema,
+  hexRecordRegionMetadataSchema,
 ]);
 export type ArtifactFormatMetadata = z.infer<
   typeof artifactFormatMetadataSchema
